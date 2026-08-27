@@ -96,23 +96,64 @@ export default function Admin() {
   const [users, setUsers] = useState(null)
   const [invites, setInvites] = useState(null)
   const [inviteOnly, setInviteOnly] = useState(false)
+  // A live count is a more useful UX cue than a spinner, and it stops a poll that just
+  // refreshed the data from re-flickering the whole list. Bumped from /api/admin/users
+  // which ships the whole users[] every 15s — we only need the change signal here.
+  const [lastPollAt, setLastPollAt] = useState(null)
 
-  const loadUsers = () => api('/api/admin/users').then(d => { setUsers(d.users); setInviteOnly(d.invite_only) }).catch(e => toast(e.message || 'Failed to load'))
+  const loadUsers = () => api('/api/admin/users').then(d => { setUsers(d.users); setInviteOnly(d.invite_only); setLastPollAt(Date.now()) }).catch(e => toast(e.message || 'Failed to load'))
   const loadInvites = () => api('/api/admin/invites').then(d => setInvites(d.invites)).catch(() => {})
-  // poll every 15s so the "training now" section stays live without a manual refresh
-  useEffect(() => { if (!user?.admin) return; loadUsers(); loadInvites(); const iv = setInterval(loadUsers, 15000); return () => clearInterval(iv) }, [])
+  // Polling strategy:
+  //  - 20s when the tab is visible (matches the 20s heartbeat the workout view sends
+  //    to /api/activity, so the "training now" section can't lag by more than one tick).
+  //  - paused when the tab is hidden — the admin is not looking, no need to spend
+  //    bandwidth or read every state-<uid>.json from disk every 20s.
+  //  - resumes with an immediate fetch on visibilitychange → visible, so the screen
+  //    does not have to wait up to 20s after switching back to the tab.
+  //  - cleaned up on unmount and on user/admin change. The empty dep array was right;
+  //    `user?.admin` is what gates the whole effect.
+  useEffect(() => {
+    if (!user?.admin) return
+    let iv = null
+    let stopped = false
+    const tick = () => { if (!stopped && document.visibilityState === 'visible') loadUsers() }
+    const loadAll = () => { if (!stopped && document.visibilityState === 'visible') { loadUsers(); loadInvites() } }
+    const onVis = () => { if (document.visibilityState === 'visible') loadAll() }
+    loadAll()
+    iv = setInterval(tick, 20000)
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      stopped = true
+      clearInterval(iv)
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [user?.admin])
   if (!user?.admin) return null
 
   const openUser = id => openSheet(close => <UserDetail id={id} onChanged={loadUsers} close={close} />)
   const liveUsers = (users || []).filter(u => u.live)
   const activeCount = (users || []).filter(u => u.lastSync && Date.now() - u.lastSync < 7 * 86400000).length
   const disabledCount = (users || []).filter(u => u.disabled).length
+  // Relative "updated Ns ago" — same shape Settings uses for `gym_dirty` so the admin
+  // knows whether the numbers they are looking at are fresh. Without a tick the label
+  // would freeze at the moment of the last poll; a tiny interval bumps it forward every
+  // 5s until 60s, then every 30s — enough granularity for "is this live" without burning
+  // a re-render every second forever.
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => {
+    if (lastPollAt == null) return
+    const age = now - lastPollAt
+    const ms = age < 60000 ? 5000 : 30000
+    const t = setTimeout(() => setNow(Date.now()), ms)
+    return () => clearTimeout(t)
+  }, [now, lastPollAt])
+  const pollAge = lastPollAt ? Math.max(0, Math.floor((now - lastPollAt) / 1000)) : null
 
   return <div className="narrow">
     <div className="hdr">
       <button className="iconbtn" onClick={() => nav('/settings')} aria-label="Back"><Icon name="chevronLeft" /></button>
       <div style={{ flex: 1, marginLeft: 8 }}><h1 style={{ margin: 0 }}>Admin</h1>
-        <div className="sub">{users ? users.length + ' users · ' + activeCount + ' active this week' : 'Loading…'}</div></div>
+        <div className="sub">{users ? users.length + ' users · ' + activeCount + ' active this week' : 'Loading…'}{pollAge != null ? ' · ' + (pollAge < 5 ? 'just now' : pollAge + 's ago') : ''}</div></div>
       <button className="iconbtn" onClick={() => { loadUsers(); loadInvites() }} aria-label="refresh">↻</button>
     </div>
 
