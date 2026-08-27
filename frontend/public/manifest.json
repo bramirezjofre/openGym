@@ -8,8 +8,45 @@
   "orientation": "portrait",
   "background_color": "#0c0e12",
   "theme_color": "#0c0e12",
+  "categories": ["fitness", "health", "lifestyle"],
   "icons": [
-    { "src": "icon-180.png", "sizes": "180x180", "type": "image/png", "purpose": "any" },
-    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "icon-180.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Start workout",
+      "short_name": "Start",
+      "url": "./#/workout",
+      "description": "Jump straight into today's session"
+    },
+    {
+      "name": "Log body weight",
+      "short_name": "Weigh-in",
+      "url": "./#/home",
+      "description": "Record today's weigh-in"
+    }
   ]
 }

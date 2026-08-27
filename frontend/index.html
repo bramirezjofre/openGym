@@ -10,9 +10,14 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="openGym">
-<link rel="manifest" href="manifest.json">
-<link rel="apple-touch-icon" href="icon-180.png">
-<link rel="icon" type="image/png" href="icon-180.png">
+<!-- Favicons: prefer ICO for legacy browsers, fall back to PNG. 32/16 are
+     what tabs / bookmark bars actually request; 180 and 192 cover PWA launchers
+     and iOS Apple Touch; the 180 also wins on macOS Safari pinned tabs. -->
+<link rel="icon" type="image/x-icon" href="./favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="./favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="./favicon-16.png">
+<link rel="apple-touch-icon" href="./icon-180.png">
+<link rel="manifest" href="./manifest.json">
 </head>
 <body>
 <div id="root"></div>
