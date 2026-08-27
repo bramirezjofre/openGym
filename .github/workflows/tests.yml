@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  frontend:
+    name: frontend (vitest + locale check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run unit tests
+        working-directory: frontend
+        run: npm test
+
+      - name: Run locale key parity check
+        working-directory: frontend
+        run: node scripts/check-locales.mjs
+
+  # Backend tests would land here once they exist. The api/server.js has no test suite today
+  # (documented as a recommendation in the bug audit); the spot below is the place for them.
+  # Keeping the matrix single-job for now keeps the workflow readable.

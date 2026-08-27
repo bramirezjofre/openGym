@@ -22,9 +22,10 @@ services:
     restart: "no"
 
   # Passkey auth + per-user data (Node, no framework).
-  # image: prebuilt (docker compose pull). build: from source (docker compose up --build).
+  # Always built from source — upstream prebuilt images at ghcr.io/duartesantos8 are
+  # unreachable (registry returns "denied" as of 2026-08), so `docker compose pull` will
+  # fail and the compose must rely on the local `./api` build context instead.
   api:
-    image: ghcr.io/duartesantos8/opengym-api:latest
     build: ./api
     restart: unless-stopped
     env_file: .env
@@ -36,8 +37,10 @@ services:
 
   # Builds the React frontend (multi-stage) and serves it, proxying /api → api
   # and the exercise media from the shared volume. Single origin for passkeys.
+  # Always built from source — see the api service note about the upstream GHCR being
+  # unreachable; `web/Dockerfile` is the multi-stage build that produces the static
+  # assets and the nginx that serves them.
   web:
-    image: ghcr.io/duartesantos8/opengym-web:latest
     build:
       context: .
       dockerfile: web/Dockerfile

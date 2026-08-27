@@ -105,7 +105,15 @@ export const useStore = create((set, get) => {
       if (!get().user) return
       clearTimeout(pushTm)
       try { await api('/api/data', { method: 'PUT', body: JSON.stringify({ state: get().S }) }); localStorage.removeItem('gym_dirty') }
-      catch (e) { localStorage.setItem('gym_dirty', '1') }
+      catch (e) {
+        localStorage.setItem('gym_dirty', '1')
+        // A push that fails because the server is unreachable would otherwise leave the dirty
+        // mark forever — the next tab open replays, but a long-running tab never does. Schedule
+        // a single retry that fires whether or not the user does anything, so an offline edit
+        // gets out as soon as the network is back. 30s is long enough to ride out a flake, short
+        // enough that a multi-day outage does not hammer the server on every back-online moment.
+        setTimeout(() => { if (localStorage.getItem('gym_dirty') === '1') get().pushState() }, 30000)
+      }
     },
     async pullState() {
       try {
@@ -176,6 +184,11 @@ export const useStore = create((set, get) => {
         const me = await api('/api/me')
         get().setUser(me.user)
         await get().pullState()
+        // If a prior session left the local copy marked dirty (push failed, tab was killed),
+        // try once now — boot() is the moment a network is most likely to be back, and the
+        // normal push path on every edit is the long tail. Best-effort: if it still fails,
+        // the 30s retry in pushState() will keep poking.
+        if (localStorage.getItem('gym_dirty') === '1') get().pushState()
         // Re-stamp the reminder's timezone on every load — keeps it correct if you're travelling,
         // without needing to revisit Settings.
         const tz = localTZ()

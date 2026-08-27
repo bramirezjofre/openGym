@@ -41,7 +41,17 @@ try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
 db.subs = db.subs || [];
 db.invites = db.invites || [];
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
-function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2)); }
+// Serialised writes: Node is single-threaded for JS but JSON.stringify of a shared mutable
+// object interleaves when two handlers run back-to-back (their microtasks can split the
+// stringify). atomicWrite on the file side keeps the bytes safe, but the in-memory `db` can
+// still lose updates as last-write-wins. A single shared promise queues every save behind
+// the one before it, so the in-memory state each save captures is the one the prior save
+// produced.
+let writeChain = Promise.resolve();
+function saveDb() {
+  const snapshot = JSON.stringify(db, null, 2);
+  writeChain = writeChain.then(() => atomicWrite(dbFile, snapshot)).catch(e => console.error('db write failed', e));
+}
 function atomicWrite(file, content) {
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, content);

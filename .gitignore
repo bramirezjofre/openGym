@@ -1,0 +1,30 @@
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Runtime data — everything the server writes
+data/
+.env
+.env.*
+!.env.example
+
+# Exercise media (~140 MB, pulled by the `media` compose service at first run)
+media/img/
+media/gif/
+
+# Generated CI / Docker artifacts
+docker-compose.override.yml
+*.tar
