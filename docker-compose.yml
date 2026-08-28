@@ -45,16 +45,6 @@ services:
       context: .
       dockerfile: web/Dockerfile
     restart: unless-stopped
-    # JSON-file logging with a stable tag makes the log path predictable for
-    # fail2ban to tail. Without a tag, the filename is the container ID and
-    # changes every time the container is recreated, breaking any log
-    # symlink the host's fail2ban config relies on. See fail2ban/README.md.
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-        tag: "opengym-web"
     depends_on:
       media:
         condition: service_completed_successfully
@@ -63,5 +53,6 @@ services:
     ports:
       - "${WEB_PORT:-8080}:80"
     volumes:
+      - /var/log/opengym:/var/log/opengym
       - ./media/img:/usr/share/nginx/html/img:ro
       - ./media/gif:/usr/share/nginx/html/gif:ro

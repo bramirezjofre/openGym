@@ -1,14 +1,12 @@
 # openGym fail2ban setup
 
-This directory holds the fail2ban config for the openGym server. The
-files here are **not auto-installed** — the agent that produced them
-does not have sudo on this host. Drop them in by hand and enable.
+This directory holds the fail2ban config for the openGym server.
 
 ## What's here
 
-- `nginx-http-opengym.conf` — filter that matches the openGym-web
-  container's access log lines. Treats any 4xx/5xx as a fail; tolerates
-  the docker stdout prefix used by `docker logs`.
+- `nginx-http-opengym.conf` — filter that matches the combined-format
+  nginx access log written by the openGym-web container at
+  `/var/log/opengym/access.log` (bind-mounted from the host).
 - `jail-openGym.local` — two jails:
   - `opengym-auth` — 5 failures in 10 min on `/api/register` or
     `/api/login` → 24h ban. Stops passkey-enumeration cold.
@@ -17,53 +15,66 @@ does not have sudo on this host. Drop them in by hand and enable.
 
 ## Install (manual, one time)
 
+The agent that produced these configs does not have sudo on this host,
+so the install is manual. The config files themselves are already
+committed; you only need to drop them in the right place and reload.
+
 ```bash
-# 1. Install the package
+# 1. Install fail2ban
 sudo apt-get install -y fail2ban
 
-# 2. Make sure docker compose writes openGym-web logs to a file fail2ban
-#    can tail. Add this to the web service in docker-compose.yml:
-#
-#    web:
-#      logging:
-#        driver: json-file
-#        options:
-#          max-size: "10m"
-#          max-file: "3"
-#          tag: "opengym-web"
-#
-#    Then restart: docker compose up -d web
-#
-# 3. Symlink the host-side docker log into a stable path. The tag makes
-#    the json-file name predictable; the actual filename is the container
-#    ID with .json log extension:
-sudo mkdir -p /var/log/openGym
-LOG=$(sudo docker inspect --format='{{.LogPath}}' opengym-web-1)
-sudo ln -sf "$LOG" /var/log/openGym/access.log
-sudo systemctl restart docker  # not needed, just an example
+# 2. Create the log directory and chown it so nginx (uid 101 inside the
+#    container) can write to the bind mount. The bind source must exist
+#    before docker-compose can mount it.
+sudo mkdir -p /var/log/opengym
+sudo chown 101:101 /var/log/opengym
 
-# 4. Drop in the filter and jail
+# 3. Drop in the filter and jail
 sudo cp fail2ban/nginx-http-opengym.conf /etc/fail2ban/filter.d/
 sudo cp fail2ban/jail-openGym.local /etc/fail2ban/jail.d/
 
-# 5. Enable and reload
+# 4. Validate, then enable
+sudo fail2ban-client --test
 sudo systemctl enable --now fail2ban
 sudo fail2ban-client reload
 
-# 6. Verify
+# 5. Verify
 sudo fail2ban-client status
 sudo fail2ban-client status opengym-auth
 sudo fail2ban-client status opengym-scan
 ```
 
+## How the logs flow now
+
+```
+Browser request
+     ↓
+Nginx Proxy Manager (HTTPS, terminates TLS)
+     ↓
+opengym-web container (nginx on :80)
+     ↓
+access_log /var/log/opengym/access.log
+     ↓
+/var/log/opengym/access.log   ← bind-mount: same file, host side
+     ↓
+fail2ban (tailing /var/log/opengym/access.log)
+     ↓
+nftables ban
+```
+
+The bind-mount is stable across container recreates — the file path on
+the host never changes, so the symlink-via-docker-logpath workaround
+(used in the first iteration) is no longer needed.
+
 ## Operate
 
 ```bash
 # List currently banned IPs
-sudo fail2ban-client get opengym-scan banlist
+sudo fail2ban-client status opengym-auth
+sudo fail2ban-client status opengym-scan
 
 # Unban a specific IP (e.g. yourself after a test)
-sudo fail2ban-client set opengym-scan unbanip 203.0.113.42
+sudo fail2ban-client set opengym-auth unbanip 203.0.113.42
 
 # Tail the jail log to see what's being banned and why
 sudo tail -f /var/log/fail2ban.log

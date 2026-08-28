@@ -15,6 +15,12 @@ COPY frontend/ ./
 RUN npm run build
 
 FROM nginx:alpine
+# /var/log/opengym will be bind-mounted from the host so fail2ban can tail
+# a stable path. nginx:alpine runs as uid 101; create the directory ahead
+# of the mount so the bind target exists and has a sane owner if the
+# operator ever starts the container without the mount (logs would then
+# stay inside the container, which is fine for development).
+RUN mkdir -p /var/log/opengym && chown -R nginx:nginx /var/log/opengym
 COPY web/nginx.conf /etc/nginx/conf.d/default.conf
 COPY web/security-headers.conf /etc/nginx/conf.d/security-headers.conf
 COPY --from=build /app/dist /usr/share/nginx/html
