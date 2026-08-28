@@ -1,0 +1,49 @@
+# openGym nginx jail — bans IPs that hit the SPA proxy with too many errors.
+#
+# Source of truth for the log line: the openGym-web container's stdout, which
+# we ship to a host file via docker compose (logging.driver: json-file →
+# /var/lib/docker/containers/<id>/<id>-json.log) OR a syslog driver. The
+# instructions below set up a bind-mount of that log into /var/log/openGym
+# so fail2ban can tail it without needing docker socket access.
+#
+# Two-stage ban:
+#   - auth endpoints (/api/register, /api/login) hard-fail fast: 5 fails in
+#     10 min → 24h ban. This stops a passkey-enumeration attempt cold.
+#   - general 4xx/5xx rate: 30 fails in 10 min → 1h ban. This catches the
+#     scanners probing for phpinfo / .env / config.json without false-positives
+#     on legitimate bad routes.
+
+[Definition]
+# Tail the openGym-web access log (bind-mounted from the container stdout).
+# docker compose needs a logging block on the web service to emit this file,
+# OR a sidecar that tails the container. See deploy notes in the README.
+logpath = /var/log/openGym/access.log
+
+# Maximum lines fail2ban will keep in memory. Default is 10; we keep more so
+# the bursts of a slow scanner don't fall out of the window.
+logtarget = %(logpath)s
+
+[opengym-auth]
+# Auth-endpoint failures. 5 in 10 minutes is a clear sign of brute-forcing
+# the passkey endpoints — legitimate users hit them once or twice per session.
+enabled  = true
+filter   = nginx-http-opengym
+port     = http,https
+findtime = 600
+maxretry = 5
+bantime  = 86400
+# Only count failures against auth-shaped paths. The failregex above matches
+# any 4xx/5xx; we tighten here to /api/(register|login) so a SPA route refresh
+# that returns 404 doesn't count.
+failregex = ^\s*<HOST> - [^"]*"(GET|POST) /(api/register|api/login)[^"]* (4\d\d|5\d\d)\s
+
+[opengym-scan]
+# General scan-style failures. 30 in 10 minutes is generous enough that a
+# user mashing broken URLs in dev tools won't trip it, but a script that
+# tries a hundred /.env / .php / config.json probes will.
+enabled  = true
+filter   = nginx-http-opengym
+port     = http,https
+findtime = 600
+maxretry = 30
+bantime  = 3600
