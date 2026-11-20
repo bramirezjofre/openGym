@@ -1,5 +1,5 @@
 /* opengym-api — passkey (WebAuthn) auth + per-user state storage for openGym
-   No framework, JSON-file storage, signed session cookies.               */
+   No framework, no SQL in this file, signed session cookies.            */
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -9,6 +9,10 @@ import {
   generateAuthenticationOptions, verifyAuthenticationResponse
 } from '@simplewebauthn/server';
 import webpush from 'web-push';
+import { openDb } from './db.js';
+import { createRepo } from './repo.js';
+import { schemaFor } from './schema.js';
+import { migrateLegacyJson } from './migrate.js';
 
 const PORT = +(process.env.PORT || 3000);
 const DATA = process.env.DATA_DIR || '/data';
@@ -35,31 +39,24 @@ const secretFile = path.join(DATA, 'secret');
 if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
 const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
 
-const dbFile = path.join(DATA, 'db.json');
-let db = { users: [], creds: [], subs: [], invites: [] };
-try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
-db.subs = db.subs || [];
-db.invites = db.invites || [];
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
-// Serialised writes: Node is single-threaded for JS but JSON.stringify of a shared mutable
-// object interleaves when two handlers run back-to-back (their microtasks can split the
-// stringify). atomicWrite on the file side keeps the bytes safe, but the in-memory `db` can
-// still lose updates as last-write-wins. A single shared promise queues every save behind
-// the one before it, so the in-memory state each save captures is the one the prior save
-// produced.
-let writeChain = Promise.resolve();
-function saveDb() {
-  const snapshot = JSON.stringify(db, null, 2);
-  writeChain = writeChain.then(() => atomicWrite(dbFile, snapshot)).catch(e => console.error('db write failed', e));
-}
-function atomicWrite(file, content) {
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, content);
-  fs.renameSync(tmp, file);
-}
-const stateFile = uid => path.join(DATA, 'state-' + uid.replace(/[^a-zA-Z0-9_-]/g, '') + '.json');
-function readState(uid) {
-  try { return JSON.parse(fs.readFileSync(stateFile(uid), 'utf8')); } catch { return null; }
+
+/* ---------- store ---------- */
+// The store is a real database behind a repository (see repo.js): every query
+// lives there, and this file never sees SQL. SQLite ships in the Node
+// standard library, so this adds no dependency, no container and no RAM to
+// the host — and the repository keeps the door open for Postgres later
+// without touching a single handler below.
+const db = openDb({ file: path.join(DATA, 'gym.db') });
+db.exec(schemaFor(db.driver));
+const repo = createRepo(db);
+
+// One-time import of the previous JSON store. Idempotent: it only runs when
+// the database has no users and the legacy file does, so a restart never
+// re-imports and the legacy files stay on disk as the rollback.
+const migrated = migrateLegacyJson({ dataDir: DATA, repo });
+if (migrated.imported) {
+  console.log('migrated legacy JSON store: ' + JSON.stringify(migrated));
 }
 
 /* ---------- push notifications (Web Push / VAPID) ---------- */
@@ -71,10 +68,9 @@ const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:ad
 webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 
 async function sendPush(userId, payload) {
-  const subs = db.subs.filter(s => s.userId === userId);
+  const subs = repo.subs.byUser(userId);
   if (!subs.length) return;
   const body = JSON.stringify(payload);
-  let dirty = false;
   await Promise.all(subs.map(async sub => {
     // urgency 'high' is the one lever we have over delivery speed — iOS/Android throttle
     // low-urgency background push more aggressively under battery-saving modes. TTL is left
@@ -85,11 +81,10 @@ async function sendPush(userId, payload) {
     catch (e) {
       console.error('push send failed', userId, e.statusCode, e.body || e.message);
       if (e.statusCode === 404 || e.statusCode === 410) {
-        db.subs = db.subs.filter(s => s.endpoint !== sub.endpoint); dirty = true;
+        repo.subs.deleteByEndpoint(sub.endpoint); dirty = true;
       }
     }
   }));
-  if (dirty) saveDb();
 }
 
 // Rest-timer alerts: client schedules on start/extend, cancels on skip or on-screen completion —
@@ -130,9 +125,9 @@ function userNow(tz) {
   } catch { return null; } // unknown/invalid tz string — skip this user rather than guess
 }
 setInterval(() => {
-  for (const user of db.users) {
-    if (!db.subs.some(s => s.userId === user.id)) continue;
-    const S = readState(user.id);
+  for (const user of repo.users.list()) {
+    if (!repo.subs.hasForUser(user.id)) continue;
+    const S = repo.state.get(user.id);
     if (!S?.reminder?.on) continue;
     const now = userNow(S.reminder.tz || 'UTC');
     if (!now || S.reminder.time !== now.hhmm) continue;
@@ -143,7 +138,7 @@ setInterval(() => {
     const routine = (S.routines || []).find(r => r.id === rid);
     console.log('reminder firing', user.id, rid);
     user.lastReminder = now.date;
-    saveDb();
+    repo.users.update(user);
     sendPush(user.id, {
       title: routine ? `${routine.emoji || '🏋️'} ${routine.name} today` : 'Workout planned today',
       body: "It's on your plan — let's go 💪",
@@ -189,7 +184,7 @@ function readSession(req) {
   if (!payload) return null;
   const [uid, exp, ver] = payload.split(':');
   if (!uid || +exp < Date.now()) return null;
-  const user = db.users.find(u => u.id === uid) || null;
+  const user = repo.users.byId(uid);
   if (!user) return null;
   if (user.disabled) return null;           // disabled accounts are locked out everywhere
   // Missing third field = pre-versioning cookie = version 0. Anything non-numeric is a malformed
@@ -248,8 +243,8 @@ function verifyPassword(password, stored) {
 
 // Brute-force guard. In-memory, so it resets on restart — that is the right trade for a
 // self-hosted instance: a restart is a deliberate admin action, and persisting the counter
-// would mean another write path for the db.json snapshot. The window is small and the
-// limit is per (ip, user) pair, so one attacker cannot lock a legitimate user out for long.
+// would mean another table and another write path. The window is small and the limit is
+// per (ip, user) pair, so one attacker cannot lock a legitimate user out for long.
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 8;
 const loginAttempts = new Map();   // key -> { count, first, lockedUntil }
@@ -333,14 +328,14 @@ setInterval(() => { for (const [k, v] of presence) if (Date.now() - v.updatedAt 
 
 /* ---------- routes ---------- */
 const routes = {
-  'GET /api/health': async (req, res) => json(res, 200, { ok: true, users: db.users.length }),
+  'GET /api/health': async (req, res) => json(res, 200, { ok: true, users: repo.users.count() }),
 
   // Public config the login screen needs before anyone is signed in.
   'GET /api/config': async (req, res) => json(res, 200, {
     invite_only: INVITE_ONLY,
     // True only while the instance has no accounts at all. The first account created
     // becomes the admin — see POST /api/admin/bootstrap. Exposes no user data.
-    needs_bootstrap: db.users.length === 0
+    needs_bootstrap: repo.users.count() === 0
   }),
 
   'GET /api/me': async (req, res) => {
@@ -354,7 +349,7 @@ const routes = {
     const name = String(body.name || '').trim().slice(0, 40);
     if (!name) return json(res, 400, { error: 'name required' });
     const code = String(body.code || '').trim().toUpperCase();
-    if (INVITE_ONLY && !db.invites.some(i => i.code === code && !i.usedBy && !i.revoked))
+    if (INVITE_ONLY && !repo.invites.validByCode(code))
       return json(res, 403, { error: 'a valid invite code is required' });
     const uid = crypto.randomBytes(12).toString('base64url');
     const options = await generateRegistrationOptions({
@@ -384,23 +379,25 @@ const routes = {
     } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
     if (!verification.verified) return json(res, 400, { error: 'not verified' });
     const { credential } = verification.registrationInfo;
-    if (db.creds.find(x => x.id === credential.id)) return json(res, 409, { error: 'credential already registered' });
+    if (repo.creds.byId(credential.id)) return json(res, 409, { error: 'credential already registered' });
     // Re-check the invite at the last moment (it may have been used/revoked since options), then burn it.
     let invite = null;
     if (INVITE_ONLY) {
-      invite = db.invites.find(i => i.code === c.code && !i.usedBy && !i.revoked);
+      invite = repo.invites.validByCode(c.code);
       if (!invite) return json(res, 403, { error: 'invite code is no longer valid — ask for a new one' });
     }
     const user = { id: c.uid, name: c.name, created: new Date().toISOString() };
-    if (invite) { user.invitedBy = invite.code; invite.usedBy = user.id; invite.usedAt = user.created; }
-    db.users.push(user);
-    db.creds.push({
-      id: credential.id, userId: user.id,
-      publicKey: Buffer.from(credential.publicKey).toString('base64url'),
-      counter: credential.counter || 0,
-      transports: body.credential?.response?.transports || []
+    if (invite) { user.invitedBy = invite.code; }
+    db.tx(() => {
+      repo.users.insert(user);
+      repo.creds.insert({
+        id: credential.id, userId: user.id,
+        publicKey: Buffer.from(credential.publicKey).toString('base64url'),
+        counter: credential.counter || 0,
+        transports: body.credential?.response?.transports || []
+      });
+      if (invite) { invite.usedBy = user.id; invite.usedAt = user.created; repo.invites.update(invite); }
     });
-    saveDb();
     json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
   },
 
@@ -416,7 +413,7 @@ const routes = {
     const body = await readBody(req);
     const c = takeChallenge(body.cid);
     if (!c) return json(res, 400, { error: 'challenge expired — try again' });
-    const cred = db.creds.find(x => x.id === body.credential?.id);
+    const cred = repo.creds.byId(body.credential?.id);
     if (!cred) return json(res, 404, { error: 'unknown passkey — create a profile first' });
     let verification;
     try {
@@ -436,8 +433,8 @@ const routes = {
     } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
     if (!verification.verified) return json(res, 400, { error: 'not verified' });
     cred.counter = verification.authenticationInfo.newCounter;
-    saveDb();
-    const user = db.users.find(u => u.id === cred.userId);
+    repo.creds.update(cred);
+    const user = repo.users.byId(cred.userId);
     if (!user) return json(res, 500, { error: 'user missing' });
     if (user.disabled) return json(res, 403, { error: 'this account has been disabled' });
     json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
@@ -454,12 +451,12 @@ const routes = {
     if (!name || name.length > 40) return json(res, 400, { error: 'name is required (max 40 characters)' });
     if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
     if (password.length > PASSWORD_MAX) return json(res, 400, { error: 'password is too long' });
-    if (db.users.some(u => u.name.toLowerCase() === name.toLowerCase())) {
+    if (repo.users.existsByName(name)) {
       return json(res, 409, { error: 'a user with that name already exists' });
     }
     let invite = null;
     if (INVITE_ONLY) {
-      invite = db.invites.find(i => i.code === code && !i.usedBy && !i.revoked);
+      invite = repo.invites.validByCode(code);
       if (!invite) return json(res, 403, { error: 'invite code is required — ask the admin for one' });
     }
     const user = {
@@ -468,9 +465,11 @@ const routes = {
       created: new Date().toISOString(),
       passwordHash: hashPassword(password)
     };
-    if (invite) { user.invitedBy = invite.code; invite.usedBy = user.id; invite.usedAt = user.created; }
-    db.users.push(user);
-    saveDb();
+    if (invite) { user.invitedBy = invite.code; }
+    db.tx(() => {
+      repo.users.insert(user);
+      if (invite) { invite.usedBy = user.id; invite.usedAt = user.created; repo.invites.update(invite); }
+    });
     json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
   },
 
@@ -485,7 +484,7 @@ const routes = {
     if (loginBlocked(key)) {
       return json(res, 429, { error: 'too many failed attempts — try again in a few minutes' });
     }
-    const user = db.users.find(u => u.name.toLowerCase() === name.toLowerCase());
+    const user = repo.users.byName(name);
     // One generic message for every failure mode (unknown user, wrong password, no
     // password set) — anything more specific tells an attacker which accounts exist.
     const fail = () => { noteFailedAttempt(key); return json(res, 401, { error: 'invalid name or password' }); };
@@ -513,7 +512,7 @@ const routes = {
     }
     user.passwordHash = hashPassword(password);
     user.sv = sessionVersion(user) + 1;
-    saveDb();
+    repo.users.update(user);
     json(res, 200, { ok: true, signedOut: true });
   },
 
@@ -527,17 +526,14 @@ const routes = {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     user.sv = sessionVersion(user) + 1;
-    saveDb();
+    repo.users.update(user);
     json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie });
   },
 
   'GET /api/data': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    try {
-      const state = JSON.parse(fs.readFileSync(stateFile(user.id), 'utf8'));
-      json(res, 200, { state });
-    } catch { json(res, 200, { state: null }); }
+    json(res, 200, { state: repo.state.get(user.id) });
   },
 
   'PUT /api/data': async (req, res) => {
@@ -546,7 +542,7 @@ const routes = {
     const body = await readBody(req);
     if (!body.state || typeof body.state !== 'object') return json(res, 400, { error: 'state required' });
     delete body.state.active;              // in-progress workouts stay device-local
-    atomicWrite(stateFile(user.id), JSON.stringify(body.state));
+    repo.state.set(user.id, body.state);
     json(res, 200, { ok: true, ts: body.state._ts || null });
   },
 
@@ -558,9 +554,10 @@ const routes = {
     const body = await readBody(req);
     const sub = body.subscription;
     if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) return json(res, 400, { error: 'invalid subscription' });
-    db.subs = db.subs.filter(s => s.endpoint !== sub.endpoint);
-    db.subs.push({ userId: user.id, endpoint: sub.endpoint, keys: sub.keys, created: new Date().toISOString() });
-    saveDb();
+    db.tx(() => {
+      repo.subs.deleteByEndpoint(sub.endpoint);
+      repo.subs.insert({ userId: user.id, endpoint: sub.endpoint, keys: sub.keys, created: new Date().toISOString() });
+    });
     json(res, 200, { ok: true });
   },
 
@@ -568,8 +565,7 @@ const routes = {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
-    db.subs = db.subs.filter(s => !(s.userId === user.id && s.endpoint === body.endpoint));
-    saveDb();
+    repo.subs.deleteByUserEndpoint(user.id, body.endpoint);
     json(res, 200, { ok: true });
   },
 
@@ -615,14 +611,14 @@ const routes = {
   },
 
   /* ---------- admin dashboard ---------- */
-  // One row per user, cheap enough for a personal instance (reads each state file once).
+  // One row per user, cheap enough for a personal instance (reads each user's state once).
   // Bootstrap the first admin. An instance with no users yet has no admin, and the
   // ADMIN_UIDS route needs a uid that only exists AFTER a first account is created —
   // a chicken-and-egg the admin dashboard could not be reached through. So: the first
   // account created on an empty instance becomes the admin. Only when the instance has
   // zero users, so it can never hand the admin flag to a later arrival.
   'POST /api/admin/bootstrap': async (req, res) => {
-    if (db.users.length) return json(res, 409, { error: 'this instance already has users — ask an admin for an account' });
+    if (repo.users.count()) return json(res, 409, { error: 'this instance already has users — ask an admin for an account' });
     const body = await readBody(req);
     const name = String(body.name || '').trim();
     const password = String(body.password || '');
@@ -636,8 +632,7 @@ const routes = {
       admin: true,
       passwordHash: hashPassword(password)
     };
-    db.users.push(user);
-    saveDb();
+    repo.users.insert(user);
     json(res, 200, { ok: true, user: { id: user.id, name: user.name, admin: true } }, { 'Set-Cookie': sessionCookie(user) });
   },
 
@@ -651,7 +646,7 @@ const routes = {
     const name = String(body.name || '').trim();
     const password = String(body.password || '');
     if (!name || name.length > 40) return json(res, 400, { error: 'name is required (max 40 characters)' });
-    if (db.users.some(u => u.name.toLowerCase() === name.toLowerCase())) {
+    if (repo.users.existsByName(name)) {
       return json(res, 409, { error: 'a user with that name already exists' });
     }
     if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
@@ -663,8 +658,7 @@ const routes = {
       passwordHash: hashPassword(password)
     };
     if (body.admin === true) { user.admin = true; user.sv = 1; }
-    db.users.push(user);
-    saveDb();
+    repo.users.insert(user);
     json(res, 200, { ok: true, user: { id: user.id, name: user.name, admin: isAdmin(user) } });
   },
 
@@ -676,20 +670,20 @@ const routes = {
     const body = await readBody(req);
     const id = String(body.id || '');
     const password = String(body.password || '');
-    const u = db.users.find(x => x.id === id);
+    const u = repo.users.byId(id);
     if (!u) return json(res, 404, { error: 'no such user' });
     if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
     if (password.length > PASSWORD_MAX) return json(res, 400, { error: 'password is too long' });
     u.passwordHash = hashPassword(password);
     u.sv = sessionVersion(u) + 1;
-    saveDb();
+    repo.users.update(u);
     json(res, 200, { ok: true });
   },
 
   'GET /api/admin/users': async (req, res) => {
     if (!requireAdmin(req, res)) return;
-    const users = db.users.map(u => {
-      const S = readState(u.id) || {};
+    const users = repo.users.list().map(u => {
+      const S = repo.state.get(u.id) || {};
       const workouts = S.workouts || [];
       const last = workouts[workouts.length - 1];
       return {
@@ -698,7 +692,7 @@ const routes = {
         workouts: workouts.length,
         lastWorkout: last ? last.d : null,
         lastSync: S._ts || null,
-        hasPush: db.subs.some(s => s.userId === u.id),
+        hasPush: repo.subs.hasForUser(u.id),
         live: livePresence(u.id)
       };
     });
@@ -709,9 +703,9 @@ const routes = {
   'GET /api/admin/user': async (req, res) => {
     if (!requireAdmin(req, res)) return;
     const id = new URL(req.url, 'http://x').searchParams.get('id');
-    const u = db.users.find(x => x.id === id);
+    const u = repo.users.byId(id);
     if (!u) return json(res, 404, { error: 'no such user' });
-    const S = readState(u.id) || {};
+    const S = repo.state.get(u.id) || {};
     json(res, 200, {
       user: { id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null },
       unit: S.unit || 'kg',
@@ -725,20 +719,20 @@ const routes = {
   'POST /api/admin/user/disable': async (req, res) => {
     if (!requireAdmin(req, res)) return;
     const body = await readBody(req);
-    const u = db.users.find(x => x.id === body.id);
+    const u = repo.users.byId(body.id);
     if (!u) return json(res, 404, { error: 'no such user' });
     if (isAdmin(u)) return json(res, 400, { error: 'cannot disable an admin' });
     u.disabled = !!body.disabled;
     if (u.disabled) presence.delete(u.id);   // drop them off "training now" at once
-    saveDb();
+    repo.users.update(u);
     json(res, 200, { ok: true, id: u.id, disabled: u.disabled });
   },
 
   'GET /api/admin/invites': async (req, res) => {
     if (!requireAdmin(req, res)) return;
     // resolve usedBy uid → name for display
-    const invites = db.invites.map(i => ({
-      ...i, usedByName: i.usedBy ? (db.users.find(u => u.id === i.usedBy) || {}).name || null : null
+    const invites = repo.invites.list().map(i => ({
+      ...i, usedByName: i.usedBy ? (repo.users.byId(i.usedBy) || {}).name || null : null
     }));
     json(res, 200, { invites, invite_only: INVITE_ONLY });
   },
@@ -750,22 +744,20 @@ const routes = {
     // 16 hex chars = 64 bits, up from 8 chars / 32 bits. The app has no rate limiting by design
     // (that's the reverse proxy's job) and /api/register/options tells a caller whether a code is
     // good, so the code itself has to be the thing that isn't worth guessing. Codes already in
-    // db.json keep working — validation is an exact string compare, never a length or format check.
-    do { code = crypto.randomBytes(8).toString('hex').toUpperCase(); } while (db.invites.some(i => i.code === code));
+    // the store keep working — validation is an exact string compare, never a length or format check.
+    do { code = crypto.randomBytes(8).toString('hex').toUpperCase(); } while (repo.invites.existsByCode(code));
     const invite = { code, note: String(body.note || '').slice(0, 60), createdBy: admin.id, created: new Date().toISOString() };
-    db.invites.push(invite);
-    saveDb();
+    repo.invites.insert(invite);
     json(res, 200, { invite });
   },
 
   'POST /api/admin/invites/revoke': async (req, res) => {
     if (!requireAdmin(req, res)) return;
     const body = await readBody(req);
-    const inv = db.invites.find(i => i.code === String(body.code || '').toUpperCase());
+    const inv = repo.invites.byCode(String(body.code || '').toUpperCase());
     if (!inv) return json(res, 404, { error: 'no such code' });
     if (inv.usedBy) return json(res, 400, { error: 'already used — cannot revoke' });
-    db.invites = db.invites.filter(i => i.code !== inv.code);
-    saveDb();
+    repo.invites.deleteByCode(inv.code);
     json(res, 200, { ok: true });
   }
 };
