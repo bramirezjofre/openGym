@@ -210,6 +210,76 @@ function sessionCookie(user) {
 }
 const clearCookie = `gymsid=; Path=/; Max-Age=0; HttpOnly;${SECURE} SameSite=Lax`;
 
+/* ---------- password credentials (optional, alongside passkeys) ---------- */
+// A passkey is the primary credential. A password is the fallback for a browser or device
+// that cannot do WebAuthn — a shared family tablet, an old phone, or an account someone
+// needs to open from a laptop that has no platform authenticator. It is an ADDITIONAL
+// credential: registering one never removes the other, and /api/logout/all still revokes
+// every session for the account.
+//
+// scrypt from node:crypto, not argon2/bcrypt: those are native modules and this image is
+// Alpine (musl), where they need a source build with a working node-gyp toolchain.
+// node:crypto's scrypt is in the standard library — no dependency, no build step, no
+// supply-chain surface. Parameters follow the OWASP baseline (N=2^15, r=8, p=1).
+const SCRYPT = { N: 32768, r: 8, p: 1, keylen: 32 };
+const PASSWORD_MIN = 8;
+const PASSWORD_MAX = 200;
+// Cost parameters are stored with the hash so a future change to SCRYPT does not lock
+// out existing users — verifyPassword reads the parameters from the stored string.
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const key = crypto.scryptSync(password.normalize('NFKC'), salt, SCRYPT.keylen,
+    { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p, maxmem: 256 * 1024 * 1024 });
+  return 'scrypt$' + SCRYPT.N + '$' + SCRYPT.r + '$' + SCRYPT.p + '$' +
+    salt.toString('base64url') + '$' + key.toString('base64url');
+}
+function verifyPassword(password, stored) {
+  try {
+    const parts = String(stored || '').split('$');
+    if (parts.length !== 6 || parts[0] !== 'scrypt') return false;
+    const [, N, r, p, saltB64, keyB64] = parts;
+    const salt = Buffer.from(saltB64, 'base64url');
+    const expected = Buffer.from(keyB64, 'base64url');
+    const actual = crypto.scryptSync(password.normalize('NFKC'), salt, expected.length,
+      { N: +N, r: +r, p: +p, maxmem: 256 * 1024 * 1024 });
+    return crypto.timingSafeEqual(actual, expected);
+  } catch { return false; }
+}
+
+// Brute-force guard. In-memory, so it resets on restart — that is the right trade for a
+// self-hosted instance: a restart is a deliberate admin action, and persisting the counter
+// would mean another write path for the db.json snapshot. The window is small and the
+// limit is per (ip, user) pair, so one attacker cannot lock a legitimate user out for long.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 8;
+const loginAttempts = new Map();   // key -> { count, first, lockedUntil }
+function attemptKey(req, name) {
+  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+    req.socket.remoteAddress || '';
+  return ip + '|' + String(name || '').toLowerCase();
+}
+function loginBlocked(key) {
+  const rec = loginAttempts.get(key);
+  if (!rec) return false;
+  if (rec.lockedUntil && rec.lockedUntil > Date.now()) return true;
+  if (rec.first && Date.now() - rec.first > LOGIN_WINDOW_MS) { loginAttempts.delete(key); return false; }
+  return false;
+}
+function noteFailedAttempt(key) {
+  const rec = loginAttempts.get(key) || { count: 0, first: Date.now(), lockedUntil: 0 };
+  if (!rec.first || Date.now() - rec.first > LOGIN_WINDOW_MS) { rec.count = 0; rec.first = Date.now(); }
+  rec.count++;
+  if (rec.count >= LOGIN_MAX_ATTEMPTS) rec.lockedUntil = Date.now() + LOGIN_WINDOW_MS;
+  loginAttempts.set(key, rec);
+}
+function clearAttempts(key) { loginAttempts.delete(key); }
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of loginAttempts) {
+    if (now - (v.first || 0) > LOGIN_WINDOW_MS) loginAttempts.delete(k);
+  }
+}, 60000).unref();
+
 /* ---------- challenge store (in-memory, 5 min TTL) ---------- */
 const challenges = new Map(); // cid -> {challenge, name?, uid?, exp}
 function putChallenge(data) {
@@ -266,7 +336,12 @@ const routes = {
   'GET /api/health': async (req, res) => json(res, 200, { ok: true, users: db.users.length }),
 
   // Public config the login screen needs before anyone is signed in.
-  'GET /api/config': async (req, res) => json(res, 200, { invite_only: INVITE_ONLY }),
+  'GET /api/config': async (req, res) => json(res, 200, {
+    invite_only: INVITE_ONLY,
+    // True only while the instance has no accounts at all. The first account created
+    // becomes the admin — see POST /api/admin/bootstrap. Exposes no user data.
+    needs_bootstrap: db.users.length === 0
+  }),
 
   'GET /api/me': async (req, res) => {
     const user = readSession(req);
@@ -368,6 +443,80 @@ const routes = {
     json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
   },
 
+  // Register an account with a name and a password, without a passkey. This is the
+  // path for a device that cannot do WebAuthn. It honours INVITE_ONLY exactly like
+  // the passkey registration does — the invite code is the gate either way.
+  'POST /api/register/password': async (req, res) => {
+    const body = await readBody(req);
+    const name = String(body.name || '').trim();
+    const password = String(body.password || '');
+    const code = String(body.code || '').trim().toUpperCase();
+    if (!name || name.length > 40) return json(res, 400, { error: 'name is required (max 40 characters)' });
+    if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
+    if (password.length > PASSWORD_MAX) return json(res, 400, { error: 'password is too long' });
+    if (db.users.some(u => u.name.toLowerCase() === name.toLowerCase())) {
+      return json(res, 409, { error: 'a user with that name already exists' });
+    }
+    let invite = null;
+    if (INVITE_ONLY) {
+      invite = db.invites.find(i => i.code === code && !i.usedBy && !i.revoked);
+      if (!invite) return json(res, 403, { error: 'invite code is required — ask the admin for one' });
+    }
+    const user = {
+      id: crypto.randomBytes(12).toString('base64url'),
+      name,
+      created: new Date().toISOString(),
+      passwordHash: hashPassword(password)
+    };
+    if (invite) { user.invitedBy = invite.code; invite.usedBy = user.id; invite.usedAt = user.created; }
+    db.users.push(user);
+    saveDb();
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
+  },
+
+  // Password sign-in. Same session cookie as the passkey path — no separate session
+  // system, so a password login and a passkey login are interchangeable afterwards.
+  'POST /api/login/password': async (req, res) => {
+    const body = await readBody(req);
+    const name = String(body.name || '').trim();
+    const password = String(body.password || '');
+    if (!name || !password) return json(res, 400, { error: 'name and password are required' });
+    const key = attemptKey(req, name);
+    if (loginBlocked(key)) {
+      return json(res, 429, { error: 'too many failed attempts — try again in a few minutes' });
+    }
+    const user = db.users.find(u => u.name.toLowerCase() === name.toLowerCase());
+    // One generic message for every failure mode (unknown user, wrong password, no
+    // password set) — anything more specific tells an attacker which accounts exist.
+    const fail = () => { noteFailedAttempt(key); return json(res, 401, { error: 'invalid name or password' }); };
+    if (!user || !user.passwordHash) return fail();
+    if (user.disabled) return json(res, 403, { error: 'this account has been disabled' });
+    if (!verifyPassword(password, user.passwordHash)) return fail();
+    clearAttempts(key);
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
+  },
+
+  // Set or change the password for the signed-in account. The current password is
+  // required when one is already set, so a stolen session cookie alone cannot take
+  // over the account. Also bumps the session version, which signs out every other
+  // device — the same revocation /api/logout/all performs.
+  'POST /api/password': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    const body = await readBody(req);
+    const password = String(body.password || '');
+    const current = String(body.current || '');
+    if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
+    if (password.length > PASSWORD_MAX) return json(res, 400, { error: 'password is too long' });
+    if (user.passwordHash && !verifyPassword(current, user.passwordHash)) {
+      return json(res, 403, { error: 'current password is wrong' });
+    }
+    user.passwordHash = hashPassword(password);
+    user.sv = sessionVersion(user) + 1;
+    saveDb();
+    json(res, 200, { ok: true, signedOut: true });
+  },
+
   'POST /api/logout': async (req, res) => json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie }),
 
   // "Sign out everywhere" — bumps this user's session version, which invalidates every cookie
@@ -467,6 +616,76 @@ const routes = {
 
   /* ---------- admin dashboard ---------- */
   // One row per user, cheap enough for a personal instance (reads each state file once).
+  // Bootstrap the first admin. An instance with no users yet has no admin, and the
+  // ADMIN_UIDS route needs a uid that only exists AFTER a first account is created —
+  // a chicken-and-egg the admin dashboard could not be reached through. So: the first
+  // account created on an empty instance becomes the admin. Only when the instance has
+  // zero users, so it can never hand the admin flag to a later arrival.
+  'POST /api/admin/bootstrap': async (req, res) => {
+    if (db.users.length) return json(res, 409, { error: 'this instance already has users — ask an admin for an account' });
+    const body = await readBody(req);
+    const name = String(body.name || '').trim();
+    const password = String(body.password || '');
+    if (!name || name.length > 40) return json(res, 400, { error: 'name is required (max 40 characters)' });
+    if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
+    if (password.length > PASSWORD_MAX) return json(res, 400, { error: 'password is too long' });
+    const user = {
+      id: crypto.randomBytes(12).toString('base64url'),
+      name,
+      created: new Date().toISOString(),
+      admin: true,
+      passwordHash: hashPassword(password)
+    };
+    db.users.push(user);
+    saveDb();
+    json(res, 200, { ok: true, user: { id: user.id, name: user.name, admin: true } }, { 'Set-Cookie': sessionCookie(user) });
+  },
+
+  // Create an account directly, with a name and a password. The invite-code flow
+  // (POST /api/admin/invites/new) is for someone who will register with a passkey
+  // on their own device; this is for an account that has to exist now, with a
+  // password the admin sets and hands over. The account can also be flagged admin.
+  'POST /api/admin/user/create': async (req, res) => {
+    const admin = requireAdmin(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const name = String(body.name || '').trim();
+    const password = String(body.password || '');
+    if (!name || name.length > 40) return json(res, 400, { error: 'name is required (max 40 characters)' });
+    if (db.users.some(u => u.name.toLowerCase() === name.toLowerCase())) {
+      return json(res, 409, { error: 'a user with that name already exists' });
+    }
+    if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
+    if (password.length > PASSWORD_MAX) return json(res, 400, { error: 'password is too long' });
+    const user = {
+      id: crypto.randomBytes(12).toString('base64url'),
+      name,
+      created: new Date().toISOString(),
+      passwordHash: hashPassword(password)
+    };
+    if (body.admin === true) { user.admin = true; user.sv = 1; }
+    db.users.push(user);
+    saveDb();
+    json(res, 200, { ok: true, user: { id: user.id, name: user.name, admin: isAdmin(user) } });
+  },
+
+  // Reset an account's password. The old one is replaced outright — there is no
+  // "current password" here because the admin is not the account holder. Bumps the
+  // session version so every existing cookie for that account stops verifying.
+  'POST /api/admin/user/password': async (req, res) => {
+    const admin = requireAdmin(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const id = String(body.id || '');
+    const password = String(body.password || '');
+    const u = db.users.find(x => x.id === id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
+    if (password.length > PASSWORD_MAX) return json(res, 400, { error: 'password is too long' });
+    u.passwordHash = hashPassword(password);
+    u.sv = sessionVersion(u) + 1;
+    saveDb();
+    json(res, 200, { ok: true });
+  },
+
   'GET /api/admin/users': async (req, res) => {
     if (!requireAdmin(req, res)) return;
     const users = db.users.map(u => {
@@ -475,7 +694,7 @@ const routes = {
       const last = workouts[workouts.length - 1];
       return {
         id: u.id, name: u.name, created: u.created || null,
-        disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null,
+        disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null, hasPassword: !!u.passwordHash,
         workouts: workouts.length,
         lastWorkout: last ? last.d : null,
         lastSync: S._ts || null,

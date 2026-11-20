@@ -57,3 +57,10 @@ export async function passkeyLogin() {
   const res = await api('/api/login/verify', { method: 'POST', body: JSON.stringify({ cid, credential: credToJSON(cred) }) })
   return res.user
 }
+
+// Password sign-in. Returns the same user object as passkeyLogin, so callers do not
+// care which credential was used.
+export async function passwordLogin(name, password) {
+  const res = await api('/api/login/password', { method: 'POST', body: JSON.stringify({ name, password }) })
+  return res.user
+}

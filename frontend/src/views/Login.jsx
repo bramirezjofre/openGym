@@ -1,6 +1,7 @@
 import { useStore } from '../store/useStore.js'
 import { useUI } from '../store/useUI.js'
-import { webauthnOK, passkeyLogin, passkeyRegister, api, BIO } from '../lib/api.js'
+import { webauthnOK, passkeyLogin, passkeyRegister, passwordLogin, api, BIO } from '../lib/api.js'
+import { validatePassword } from '../lib/password.js'
 import { hasData } from '../store/useStore.js'
 import { t } from '../lib/i18n.js'
 import { DEMO, REPO } from '../lib/demo.js'
@@ -42,8 +43,119 @@ function RegisterSheet({ close }) {
   </>
 }
 
+
+function PasswordSheet({ close }) {
+  const { setUser, pullState } = useStore()
+  const [name, setName] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [busy, setBusy] = useState(false)
+  const ref = useRef(null)
+  useEffect(() => { setTimeout(() => ref.current?.focus(), 250) }, [])
+  const go = async () => {
+    const n = name.trim()
+    if (!n) { useUI.getState().toast(t('Enter a name')); return }
+    const invalid = validatePassword(password, confirm)
+    if (invalid) { useUI.getState().toast(t(invalid)); return }
+    setBusy(true)
+    try {
+      const res = await api('/api/register/password', { method: 'POST', body: JSON.stringify({ name: n, password }) })
+      setUser(res.user); close()
+      await pullState()
+      useUI.getState().toast(t('Welcome, {0}', res.user.name))
+    } catch (e) { useUI.getState().toast(e.message || t('Registration failed')) }
+    finally { setBusy(false) }
+  }
+  return <>
+    <h3>{t('Create your profile')}</h3>
+    <div className="muted small" style={{ marginBottom: 14 }}>{t('Pick a name and a password. You can add a passkey later if you want.')}</div>
+    <input ref={ref} className="input" placeholder={t('Your name')} maxLength={40} value={name} onChange={e => setName(e.target.value)} />
+    <div style={{ height: 10 }} />
+    <input className="input" type="password" placeholder={t('Password')} autoComplete="new-password" maxLength={200} value={password} onChange={e => setPassword(e.target.value)} />
+    <div style={{ height: 10 }} />
+    <input className="input" type="password" placeholder={t('Repeat password')} autoComplete="new-password" maxLength={200} value={confirm} onChange={e => setConfirm(e.target.value)} />
+    <div style={{ height: 12 }} />
+    <Button variant="primary" onClick={go} disabled={busy}>{busy ? t('Creating…') : t('Create profile')}</Button>
+  </>
+}
+
+
+
+// First account on an empty instance — it becomes the admin. Shown only while the
+// instance has no users at all (GET /api/config -> needs_bootstrap), so it cannot be
+// used to make a second admin.
+function BootstrapSheet({ close }) {
+  const { setUser, pullState } = useStore()
+  const [name, setName] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const ref = useRef(null)
+  useEffect(() => { setTimeout(() => ref.current?.focus(), 250) }, [])
+  const go = async () => {
+    const n = name.trim()
+    if (!n) { useUI.getState().toast(t('Enter a name')); return }
+    const invalid = validatePassword(password, password)
+    if (invalid) { useUI.getState().toast(t(invalid)); return }
+    setBusy(true)
+    try {
+      const res = await api('/api/admin/bootstrap', { method: 'POST', body: JSON.stringify({ name: n, password }) })
+      setUser(res.user); close()
+      await pullState()
+      useUI.getState().toast(t('Welcome, {0}', res.user.name))
+    } catch (e) { useUI.getState().toast(e.message || t('Registration failed')) }
+    finally { setBusy(false) }
+  }
+  return <>
+    <h3>{t('Create the admin account')}</h3>
+    <div className="muted small" style={{ marginBottom: 14 }}>{t('This is the first account on this instance, so it gets admin rights. Use it to create the other profiles.')}</div>
+    <input ref={ref} className="input" placeholder={t('Your name')} maxLength={40} value={name} onChange={e => setName(e.target.value)} />
+    <div style={{ height: 10 }} />
+    <input className="input" type="password" placeholder={t('Password')} autoComplete="new-password" maxLength={200} value={password} onChange={e => setPassword(e.target.value)} />
+    <div style={{ height: 12 }} />
+    <Button variant="primary" onClick={go} disabled={busy}>{busy ? t('Creating…') : t('Create admin account')}</Button>
+  </>
+}
+
+// Password sign-in, collapsed behind a link so the passkey button stays the primary
+// action on a device that supports it. Same visual language as the rest of the app:
+// .input fields, .btn, the standard row/small/dim helpers.
+function PasswordSignIn({ onSigned }) {
+  const [open, setOpen] = useState(false)
+  const [name, setName] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const go = async () => {
+    if (!name.trim() || !password) { useUI.getState().toast(t('Enter your name and password')); return }
+    setBusy(true)
+    try {
+      const u = await passwordLogin(name.trim(), password)
+      setPassword('')
+      onSigned(u)
+    } catch (e) { useUI.getState().toast(e.message || t('Sign-in failed')) }
+    finally { setBusy(false) }
+  }
+  if (!open) {
+    return <button className="btn ghost dim" onClick={() => setOpen(true)} style={{ width: '100%' }}>
+      {t('Sign in with a password')}
+    </button>
+  }
+  return <div style={{ textAlign: 'left' }}>
+    <input className="input" placeholder={t('Your name')} autoComplete="username" maxLength={40}
+      value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === 'Enter' && go()} />
+    <div style={{ height: 10 }} />
+    <input className="input" type="password" placeholder={t('Password')} autoComplete="current-password" maxLength={200}
+      value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && go()} />
+    <div style={{ height: 12 }} />
+    <Button variant="primary" onClick={go} disabled={busy}>{busy ? t('Signing in…') : t('Sign in')}</Button>
+    <div style={{ height: 6 }} />
+    <Button variant="ghost" className="dim" onClick={() => { setOpen(false); setPassword('') }}>{t('Use a passkey instead')}</Button>
+  </div>
+}
+
 export default function Login() {
   const { setUser, pullState, setGuest } = useStore()
+  const [needsBootstrap, setNeedsBootstrap] = useState(false)
+  useEffect(() => { api('/api/config').then(c => setNeedsBootstrap(!!c.needs_bootstrap)).catch(() => {}) }, [])
   const signIn = async () => {
     try { const u = await passkeyLogin(); setUser(u); await pullState(); useUI.getState().toast(t('Welcome back, {0}', u.name)) }
     catch (e) { if (e.name !== 'NotAllowedError' && e.name !== 'AbortError') useUI.getState().toast(e.message || t('Sign-in failed')) }
@@ -76,9 +188,13 @@ export default function Login() {
       {webauthnOK() ? <>
         <Button variant="primary" icon="person" onClick={signIn}>{t('Sign in with passkey')}</Button>
         <div style={{ height: 10 }} />
-        <Button icon="sparkles" onClick={() => useUI.getState().openSheet(close => <RegisterSheet close={close} />)}>{t('Create new profile')}</Button>
-        <div style={{ height: 10 }} />
       </> : <div className="card small muted" style={{ textAlign: 'left' }}>{t("This browser doesn't support passkeys — you can still use openGym locally on this device.")}</div>}
+      <PasswordSignIn onSigned={u => { setUser(u); pullState().then(() => useUI.getState().toast(t('Welcome back, {0}', u.name))) }} />
+      <div style={{ height: 10 }} />
+      {needsBootstrap
+        ? <Button variant="primary" icon="person" onClick={() => useUI.getState().openSheet(close => <BootstrapSheet close={close} />)}>{t('Create the admin account')}</Button>
+        : <Button icon="sparkles" onClick={() => useUI.getState().openSheet(close => <RegisterSheet close={close} />)}>{t('Create new profile')}</Button>}
+      <div style={{ height: 10 }} />
       <Button variant="ghost" className="dim" onClick={() => setGuest(true)}>{t('Continue without account')}</Button>
       <div className="dim small" style={{ marginTop: 26, lineHeight: 1.5 }}>{t('Passkeys use {0} — no passwords.', BIO)}<br />{t('Each profile keeps its own plan, workouts & body weight.')}</div>
     </div>

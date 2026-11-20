@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStore } from '../store/useStore.js'
 import { useUI } from '../store/useUI.js'
 import { api } from '../lib/api.js'
+import { validatePassword } from '../lib/password.js'
 import { fmtDate, fmtNum, fmtVol, fmtDur } from '../lib/format.js'
 import { workoutVolume, setsDone } from '../lib/history.js'
 import { confirmSheet } from '../sheets.jsx'
@@ -23,7 +24,7 @@ const rel = ts => {
 }
 const dur = ms => { const m = Math.max(0, Math.floor(ms / 60000)); return m < 60 ? m + 'm' : Math.floor(m / 60) + 'h' + (m % 60) + 'm' }
 
-function UserDetail({ id, onChanged, close }) {
+function UserDetail({ id, onChanged, close, onResetPassword }) {
   const [d, setD] = useState(null)
   const toast = useUI(s => s.toast)
   useEffect(() => { api('/api/admin/user?id=' + encodeURIComponent(id)).then(setD).catch(e => toast(e.message)) }, [id])
@@ -52,6 +53,9 @@ function UserDetail({ id, onChanged, close }) {
       onClick={() => u.disabled ? setDisabled(false)
         : confirmSheet({ title: 'Disable ' + u.name + '?', message: 'They are signed out everywhere and can no longer sync or log in until re-enabled.', confirmText: 'Disable', danger: true, onConfirm: () => setDisabled(true) })}>
       {u.disabled ? 'Enable account' : 'Disable account'}</button>}
+    <button className="btn" style={{ margin: '8px 0 4px' }} onClick={() => onResetPassword(u)}>
+      <Icon name="key" /><span>Reset password</span>
+    </button>
     <h4 className="sec">Workout history</h4>
     {d.workouts.length ? <div className="list" style={{ gap: 0 }}>
       {d.workouts.slice(0, 60).map(w => <div key={w.id} className="row between" style={{ padding: '9px 2px', borderBottom: '1px solid var(--sep)' }}>
@@ -86,6 +90,82 @@ function InvitesCard({ invites, reload }) {
     </div>)}
     {!open.length && !used.length && <div className="dim small">No codes yet — generate one to invite someone.</div>}
   </div>
+}
+
+
+// Create an account with a name and a password. English-only like the rest of this
+// operator dashboard — it is not part of the translated end-user surface.
+function CreateUserSheet({ close, onCreated }) {
+  const toast = useUI(s => s.toast)
+  const [name, setName] = useState('')
+  const [password, setPassword] = useState('')
+  const [isAdmin, setIsAdmin] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [show, setShow] = useState(false)
+  const ref = useRef(null)
+  useEffect(() => { setTimeout(() => ref.current?.focus(), 250) }, [])
+  const submit = async () => {
+    if (!name.trim()) { toast('Name is required'); return }
+    const invalid = validatePassword(password, password)
+    if (invalid) { toast(invalid); return }
+    setBusy(true)
+    try {
+      const res = await api('/api/admin/user/create', { method: 'POST', body: JSON.stringify({ name: name.trim(), password, admin: isAdmin }) })
+      toast('User ' + res.user.name + ' created')
+      close()
+      onCreated && onCreated()
+    } catch (e) { toast(e.message) }
+    finally { setBusy(false) }
+  }
+  return <>
+    <h3>Create user</h3>
+    <div className="muted small" style={{ marginBottom: 14 }}>The user signs in with this name and password. They can add a passkey later.</div>
+    <input ref={ref} className="input" placeholder="Name" maxLength={40} value={name} onChange={e => setName(e.target.value)} />
+    <div style={{ height: 10 }} />
+    <div className="row" style={{ gap: 8 }}>
+      <input className="input" type={show ? 'text' : 'password'} placeholder="Password" autoComplete="new-password" maxLength={200}
+        value={password} onChange={e => setPassword(e.target.value)} />
+      <button className="iconbtn" style={{ flex: 'none', width: 44, height: 44 }} onClick={() => setShow(s => !s)} aria-label="show password">
+        <Icon name={show ? 'key' : 'lock'} />
+      </button>
+    </div>
+    <div className="row" style={{ gap: 10, marginTop: 14 }}>
+      <button className={'chip nocap' + (isAdmin ? ' on' : '')} onClick={() => setIsAdmin(a => !a)} style={{ cursor: 'pointer' }}>
+        {isAdmin ? 'admin' : 'not admin'}
+      </button>
+      <span className="dim small">Grant admin rights</span>
+    </div>
+    <div style={{ height: 14 }} />
+    <Button variant="primary" onClick={submit} disabled={busy}>{busy ? 'Creating…' : 'Create user'}</Button>
+  </>
+}
+
+// Reset an account's password. The old one stops working immediately and every
+// existing session for that account is signed out.
+function ResetPasswordSheet({ user, close, onChanged }) {
+  const toast = useUI(s => s.toast)
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const submit = async () => {
+    const invalid = validatePassword(password, password)
+    if (invalid) { toast(invalid); return }
+    setBusy(true)
+    try {
+      await api('/api/admin/user/password', { method: 'POST', body: JSON.stringify({ id: user.id, password }) })
+      toast('Password updated — ' + user.name + ' was signed out')
+      close()
+      onChanged && onChanged()
+    } catch (e) { toast(e.message) }
+    finally { setBusy(false) }
+  }
+  return <>
+    <h3>New password</h3>
+    <div className="muted small" style={{ marginBottom: 14 }}>For {user.name}. Their current password stops working and all their sessions are signed out.</div>
+    <input className="input" type="password" placeholder="Password" autoComplete="new-password" maxLength={200}
+      value={password} onChange={e => setPassword(e.target.value)} />
+    <div style={{ height: 14 }} />
+    <Button variant="primary" onClick={submit} disabled={busy}>{busy ? 'Saving…' : 'Set password'}</Button>
+  </>
 }
 
 export default function Admin() {
@@ -130,7 +210,9 @@ export default function Admin() {
   }, [user?.admin])
   if (!user?.admin) return null
 
-  const openUser = id => openSheet(close => <UserDetail id={id} onChanged={loadUsers} close={close} />)
+  const openUser = id => openSheet(close => <UserDetail id={id} onChanged={loadUsers} close={close}
+    onResetPassword={u => openSheet(c2 => <ResetPasswordSheet user={u} close={c2} onChanged={loadUsers} />)} />)
+  const createUser = () => openSheet(close => <CreateUserSheet close={close} onCreated={() => { loadUsers(); loadInvites() }} />)
   const liveUsers = (users || []).filter(u => u.live)
   const activeCount = (users || []).filter(u => u.lastSync && Date.now() - u.lastSync < 7 * 86400000).length
   const disabledCount = (users || []).filter(u => u.disabled).length
@@ -175,10 +257,13 @@ export default function Admin() {
 
     <InvitesCard invites={invites} reload={loadInvites} />
 
-    <h4 className="sec">Users</h4>
+    <div className="row between" style={{ marginBottom: 8 }}>
+      <h4 className="sec" style={{ margin: 0 }}>Users</h4>
+      <Button variant="primary" size="sm" onClick={createUser} icon="plus">Create user</Button>
+    </div>
     <div className="list">
       {(users || []).map(u => <div key={u.id} className="item" onClick={() => openUser(u.id)} style={u.disabled ? { opacity: .55 } : null}>
-        <div className="grow"><div className="tt">{u.live && <Icon name="dot" style={{ fontSize: 9, color: 'var(--green)', display: 'inline-block', marginRight: 5 }} />}{u.name} {u.admin && <span className="tag acc" style={{ marginLeft: 4 }}>admin</span>}{u.disabled && <span className="tag" style={{ marginLeft: 4, color: 'var(--red)' }}>off</span>}</div>
+        <div className="grow"><div className="tt">{u.live && <Icon name="dot" style={{ fontSize: 9, color: 'var(--green)', display: 'inline-block', marginRight: 5 }} />}{u.name} {u.admin && <span className="tag acc" style={{ marginLeft: 4 }}>admin</span>}{u.hasPassword && <span className="tag" style={{ marginLeft: 4 }}>password</span>}{u.disabled && <span className="tag" style={{ marginLeft: 4, color: 'var(--red)' }}>off</span>}</div>
           <div className="ss">{u.live ? 'training now · ' + u.live.name : u.workouts + ' workouts' + (u.lastWorkout ? ' · last ' + fmtDate(u.lastWorkout) : '') + ' · synced ' + rel(u.lastSync)}</div></div>
         {u.hasPush && <Icon name="bell" title="push enabled" style={{ fontSize: 15, color: 'var(--label-3)' }} />}<Icon name="chevronRight" className="chev" />
       </div>)}
