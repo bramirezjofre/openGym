@@ -18,6 +18,12 @@
  * transaction, never the file.
  */
 import { DatabaseSync } from 'node:sqlite';
+import { createRequire } from 'node:module';
+
+// `pg` is CommonJS and is only needed by the Postgres driver, which the
+// default deployment never loads. createRequire lets it be required lazily
+// from this ESM module instead of being a hard import at the top.
+const require = createRequire(import.meta.url);
 
 /* SQLite binds only null, number, bigint, string and Uint8Array. Two
  * normalisations are needed, and both are dialect-specific rather than
@@ -75,13 +81,19 @@ export function openSqlite(file) {
       db.exec(sql);
     },
 
-    // Synchronous transaction. The repository API is synchronous throughout, so
-    // a transaction cannot be suspended mid-way by an await — which is what
-    // makes "either the whole write lands or none of it does" true here.
-    tx(fn) {
+    /* The transaction body is async (the repository methods are), so this is
+     * too. That does not open an interleaving window in SQLite: node:sqlite
+     * is synchronous, so every statement in the body has already executed by
+     * the time the body awaits — the only thing pending is a microtask. Node
+     * drains the microtask queue completely before it runs the next I/O
+     * callback, so no other request handler can slip a statement into this
+     * transaction. The Postgres driver does not have that luxury and has to
+     * hold a dedicated client instead (see db-postgres.js).
+     */
+    async tx(fn) {
       db.exec('BEGIN');
       try {
-        const result = fn();
+        const result = await fn();
         db.exec('COMMIT');
         return result;
       } catch (e) {
@@ -97,14 +109,31 @@ export function openSqlite(file) {
   };
 }
 
-/* The one line that decides the engine. To move to Postgres:
+/* The one place that decides the engine.
  *
- *   export function openDb(opts) { return openPostgres(opts.url); }
+ * DATABASE_URL selects it:
+ *   unset or file:...   -> SQLite, the default and what the deployment uses
+ *   postgres://...      -> Postgres
  *
- * and add api/postgres.js with the same interface (all/get/run/exec/tx/close),
- * translating `?` to `$1..$n` on the way in. The repository and the API above
- * it do not change.
+ * The Postgres driver is loaded on demand, so the default deployment never
+ * loads `pg` and never needs it installed. The repository and every handler
+ * above this file are identical on both engines — that is the claim the
+ * dual-engine test suite (test/repo.test.js and test/repo-postgres.test.js)
+ * checks.
  */
 export function openDb(opts = {}) {
+  // `opts.url` given explicitly wins, including when it is empty: passing
+  // url: '' forces SQLite even when DATABASE_URL is set in the environment.
+  // That is what lets the test suite run the SQLite repository against a
+  // machine that also has a Postgres to test against.
+  const url = opts.url === undefined ? (process.env.DATABASE_URL || '') : (opts.url || '');
+  if (/^postgres(ql)?:\/\//i.test(url)) {
+    // Loaded here, not at the top, so `pg` is only required when it is used.
+    const { openPostgres } = require('./db-postgres.js');
+    return openPostgres(url);
+  }
+  if (url && !url.startsWith('file:')) {
+    throw new Error('unsupported DATABASE_URL scheme: ' + url.split(':')[0]);
+  }
   return openSqlite(opts.file || '/data/gym.db');
 }

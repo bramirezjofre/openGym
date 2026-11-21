@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { resetStore, pgSchemaUrl, isPostgres } from './helpers.js';
 
 const PORT = 3971;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -33,12 +34,26 @@ const cookieOf = res => (res.setCookie || '').split(';')[0];
 
 before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gym-api-'));
+  // On Postgres each test file gets its own schema, so the files can run in
+  // parallel without truncating each other's tables.
+  if (isPostgres()) process.env.DATABASE_URL = await pgSchemaUrl('api');
+  await resetStore();
+  // If something is already listening on the port, the requests would go to
+  // that process and the assertions would be about someone else's state.
+  // Fail loudly instead of testing the wrong server.
+  try {
+    const probe = await fetch(BASE + '/api/health');
+    if (probe.ok) throw new Error('port ' + PORT + ' is already in use by another server');
+  } catch (e) {
+    if (e.message && e.message.includes('already in use')) throw e;
+  }
   child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'server.js'], {
     cwd: path.resolve(import.meta.dirname, '..'),
     env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir, RP_ID: 'localhost', ORIGIN: 'http://localhost:8080' },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   child.stderr.on('data', d => { if (/Error|error:/.test(String(d))) process.stderr.write('[api] ' + d); });
+  await resetStore(dataDir);
   // wait for the port to answer
   for (let i = 0; i < 60; i++) {
     try { await fetch(BASE + '/api/health'); return; } catch { await new Promise(r => setTimeout(r, 100)); }
@@ -209,7 +224,9 @@ test('an invite code can be generated, used and revoked', async () => {
   assert.equal(after.json.invites.some(i => i.code === code), false);
 });
 
-test('the database file is the only new thing on disk', () => {
+test('the store and the key material are on disk', { skip: isPostgres() && 'the store is a database, not a file' }, () => {
+  // Only meaningful for SQLite: with Postgres the records live in the
+  // database, but the secret and the push keys are still files.
   const files = fs.readdirSync(dataDir).sort();
   assert.ok(files.includes('gym.db'), 'the sqlite file must exist');
   assert.ok(files.includes('secret'), 'the session secret must still be there');

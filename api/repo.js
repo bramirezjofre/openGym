@@ -28,19 +28,24 @@ export function createRepo(db) {
   } : null;
 
   const users = {
-    count: () => db.get('SELECT COUNT(*) AS n FROM users').n,
+    // Number() because the engines disagree on the type of a COUNT: SQLite
+    // returns a number, Postgres returns a bigint (or a string, depending on
+    // the driver). The repository compares this with `=== 0`, so it has to be
+    // a number on every engine. Casting in SQL (`::int`) would not be
+    // portable, so it is normalised here instead.
+    count: async () => Number((await db.get('SELECT COUNT(*) AS n FROM users')).n),
 
-    byId: id => rowToUser(db.get('SELECT * FROM users WHERE id = ?', [id])),
+    byId: async id => rowToUser(await db.get('SELECT * FROM users WHERE id = ?', [id])),
 
     // Case-insensitive: the API layer has always compared
     // `name.toLowerCase() === name.toLowerCase()`.
-    byName: name => rowToUser(db.get('SELECT * FROM users WHERE LOWER(name) = LOWER(?)', [name])),
+    byName: async name => rowToUser(await db.get('SELECT * FROM users WHERE LOWER(name) = LOWER(?)', [name])),
 
-    existsByName: name => !!db.get('SELECT 1 AS x FROM users WHERE LOWER(name) = LOWER(?)', [name]),
+    existsByName: async name => !!(await db.get('SELECT 1 AS x FROM users WHERE LOWER(name) = LOWER(?)', [name])),
 
-    list: () => db.all('SELECT * FROM users ORDER BY created').map(rowToUser),
+    list: async () => (await db.all('SELECT * FROM users ORDER BY created')).map(rowToUser),
 
-    insert: u => db.run(
+    insert: async u => db.run(
       'INSERT INTO users (id, name, password_hash, admin, disabled, session_ver, created, invited_by, last_reminder)' +
       ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [u.id, u.name, u.passwordHash ?? null, u.admin ? 1 : 0, u.disabled ? 1 : 0,
@@ -49,7 +54,7 @@ export function createRepo(db) {
     // Writes the whole row. The API layer mutates a user object it already
     // holds and saves it, so replacing the row keeps that shape — and a
     // whole-row write is one statement either way.
-    update: u => db.run(
+    update: async u => db.run(
       'UPDATE users SET name = ?, password_hash = ?, admin = ?, disabled = ?,' +
       ' session_ver = ?, invited_by = ?, last_reminder = ? WHERE id = ?',
       [u.name, u.passwordHash ?? null, u.admin ? 1 : 0, u.disabled ? 1 : 0,
@@ -67,11 +72,11 @@ export function createRepo(db) {
   } : null;
 
   const creds = {
-    byId: id => rowToCred(db.get('SELECT * FROM creds WHERE id = ?', [id])),
-    insert: c => db.run(
+    byId: async id => rowToCred(await db.get('SELECT * FROM creds WHERE id = ?', [id])),
+    insert: async c => db.run(
       'INSERT INTO creds (id, user_id, public_key, counter, transports) VALUES (?, ?, ?, ?, ?)',
       [c.id, c.userId, c.publicKey, c.counter ?? 0, JSON.stringify(c.transports ?? [])]),
-    update: c => db.run('UPDATE creds SET counter = ? WHERE id = ?', [c.counter ?? 0, c.id])
+    update: async c => db.run('UPDATE creds SET counter = ? WHERE id = ?', [c.counter ?? 0, c.id])
   };
 
   /* ---------- push subscriptions ---------- */
@@ -84,14 +89,14 @@ export function createRepo(db) {
   } : null;
 
   const subs = {
-    byUser: userId => db.all('SELECT * FROM subs WHERE user_id = ?', [userId]).map(rowToSub),
-    hasForUser: userId => !!db.get('SELECT 1 AS x FROM subs WHERE user_id = ?', [userId]),
+    byUser: async userId => (await db.all('SELECT * FROM subs WHERE user_id = ?', [userId])).map(rowToSub),
+    hasForUser: async userId => !!(await db.get('SELECT 1 AS x FROM subs WHERE user_id = ?', [userId])),
     // A subscription is identified by its endpoint: the same browser endpoint
     // re-subscribing replaces the old row instead of duplicating it.
-    deleteByEndpoint: endpoint => db.run('DELETE FROM subs WHERE endpoint = ?', [endpoint]),
-    deleteByUserEndpoint: (userId, endpoint) =>
+    deleteByEndpoint: async endpoint => db.run('DELETE FROM subs WHERE endpoint = ?', [endpoint]),
+    deleteByUserEndpoint: async (userId, endpoint) =>
       db.run('DELETE FROM subs WHERE user_id = ? AND endpoint = ?', [userId, endpoint]),
-    insert: s => db.run(
+    insert: async s => db.run(
       'INSERT INTO subs (endpoint, user_id, keys, created) VALUES (?, ?, ?, ?)',
       [s.endpoint, s.userId, JSON.stringify(s.keys), s.created ?? null])
   };
@@ -109,40 +114,42 @@ export function createRepo(db) {
   } : null;
 
   const invites = {
-    byCode: code => rowToInvite(db.get('SELECT * FROM invites WHERE code = ?', [code])),
+    byCode: async code => rowToInvite(await db.get('SELECT * FROM invites WHERE code = ?', [code])),
 
     // An invite is usable when it exists, has not been used and has not been
     // revoked. The empty-string check mirrors the old `!i.usedBy` test.
-    validByCode: code => rowToInvite(db.get(
+    // `revoked = 0` and not `revoked = false`: the flag column is INTEGER on
+    // every engine (see schema.js), so the comparison is the same everywhere.
+    validByCode: async code => rowToInvite(await db.get(
       'SELECT * FROM invites WHERE code = ? AND (used_by IS NULL OR used_by = \'\') AND revoked = 0',
       [code])),
 
-    existsByCode: code => !!db.get('SELECT 1 AS x FROM invites WHERE code = ?', [code]),
+    existsByCode: async code => !!(await db.get('SELECT 1 AS x FROM invites WHERE code = ?', [code])),
 
-    list: () => db.all('SELECT * FROM invites ORDER BY created DESC').map(rowToInvite),
+    list: async () => (await db.all('SELECT * FROM invites ORDER BY created DESC')).map(rowToInvite),
 
-    insert: i => db.run(
+    insert: async i => db.run(
       'INSERT INTO invites (code, note, created_by, created, used_by, used_at, revoked)' +
       ' VALUES (?, ?, ?, ?, ?, ?, ?)',
       [i.code, i.note ?? null, i.createdBy ?? null, i.created ?? null,
         i.usedBy ?? null, i.usedAt ?? null, i.revoked ? 1 : 0]),
 
-    update: i => db.run(
+    update: async i => db.run(
       'UPDATE invites SET note = ?, used_by = ?, used_at = ?, revoked = ? WHERE code = ?',
       [i.note ?? null, i.usedBy ?? null, i.usedAt ?? null, i.revoked ? 1 : 0, i.code]),
 
-    deleteByCode: code => db.run('DELETE FROM invites WHERE code = ?', [code])
+    deleteByCode: async code => db.run('DELETE FROM invites WHERE code = ?', [code])
   };
 
   /* ---------- per-user state ---------- */
 
   const state = {
-    get: uid => {
-      const row = db.get('SELECT json FROM state WHERE uid = ?', [uid]);
+    get: async uid => {
+      const row = await db.get('SELECT json FROM state WHERE uid = ?', [uid]);
       if (!row) return null;
       try { return JSON.parse(row.json); } catch { return null; }
     },
-    set: (uid, obj) => db.run(
+    set: async (uid, obj) => db.run(
       'INSERT INTO state (uid, json) VALUES (?, ?)' +
       ' ON CONFLICT(uid) DO UPDATE SET json = excluded.json',
       [uid, JSON.stringify(obj)])

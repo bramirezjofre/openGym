@@ -47,14 +47,16 @@ const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(us
 // standard library, so this adds no dependency, no container and no RAM to
 // the host — and the repository keeps the door open for Postgres later
 // without touching a single handler below.
-const db = openDb({ file: path.join(DATA, 'gym.db') });
+// DATABASE_URL picks the engine (see db.js). Unset means SQLite at this path,
+// which is what the shipped compose does.
+const db = openDb({ file: path.join(DATA, 'gym.db'), url: process.env.DATABASE_URL });
 db.exec(schemaFor(db.driver));
 const repo = createRepo(db);
 
 // One-time import of the previous JSON store. Idempotent: it only runs when
 // the database has no users and the legacy file does, so a restart never
 // re-imports and the legacy files stay on disk as the rollback.
-const migrated = migrateLegacyJson({ dataDir: DATA, repo });
+const migrated = await migrateLegacyJson({ dataDir: DATA, repo });
 if (migrated.imported) {
   console.log('migrated legacy JSON store: ' + JSON.stringify(migrated));
 }
@@ -68,7 +70,7 @@ const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:ad
 webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 
 async function sendPush(userId, payload) {
-  const subs = repo.subs.byUser(userId);
+  const subs = await repo.subs.byUser(userId);
   if (!subs.length) return;
   const body = JSON.stringify(payload);
   await Promise.all(subs.map(async sub => {
@@ -81,7 +83,7 @@ async function sendPush(userId, payload) {
     catch (e) {
       console.error('push send failed', userId, e.statusCode, e.body || e.message);
       if (e.statusCode === 404 || e.statusCode === 410) {
-        repo.subs.deleteByEndpoint(sub.endpoint); dirty = true;
+        await repo.subs.deleteByEndpoint(sub.endpoint); dirty = true;
       }
     }
   }));
@@ -124,10 +126,10 @@ function userNow(tz) {
     return { date: `${g('year')}-${g('month')}-${g('day')}`, hhmm: `${g('hour')}:${g('minute')}` };
   } catch { return null; } // unknown/invalid tz string — skip this user rather than guess
 }
-setInterval(() => {
-  for (const user of repo.users.list()) {
-    if (!repo.subs.hasForUser(user.id)) continue;
-    const S = repo.state.get(user.id);
+setInterval(async () => {
+  for (const user of await repo.users.list()) {
+    if (!await repo.subs.hasForUser(user.id)) continue;
+    const S = await repo.state.get(user.id);
     if (!S?.reminder?.on) continue;
     const now = userNow(S.reminder.tz || 'UTC');
     if (!now || S.reminder.time !== now.hhmm) continue;
@@ -138,7 +140,7 @@ setInterval(() => {
     const routine = (S.routines || []).find(r => r.id === rid);
     console.log('reminder firing', user.id, rid);
     user.lastReminder = now.date;
-    repo.users.update(user);
+    await repo.users.update(user);
     sendPush(user.id, {
       title: routine ? `${routine.emoji || '🏋️'} ${routine.name} today` : 'Workout planned today',
       body: "It's on your plan — let's go 💪",
@@ -174,7 +176,7 @@ function makeSession(user) {
   const exp = Date.now() + SESSION_DAYS * 86400000;
   return sign(user.id + ':' + exp + ':' + sessionVersion(user));
 }
-function readSession(req) {
+async function readSession(req) {
   const cookies = Object.fromEntries((req.headers.cookie || '').split(';').map(c => {
     const i = c.indexOf('='); return i < 0 ? ['', ''] : [c.slice(0, i).trim(), c.slice(i + 1).trim()];
   }));
@@ -184,7 +186,7 @@ function readSession(req) {
   if (!payload) return null;
   const [uid, exp, ver] = payload.split(':');
   if (!uid || +exp < Date.now()) return null;
-  const user = repo.users.byId(uid);
+  const user = await repo.users.byId(uid);
   if (!user) return null;
   if (user.disabled) return null;           // disabled accounts are locked out everywhere
   // Missing third field = pre-versioning cookie = version 0. Anything non-numeric is a malformed
@@ -194,8 +196,8 @@ function readSession(req) {
   return user;
 }
 // Guard for /api/admin/* — resolves the caller and 401/403s if they aren't an admin.
-function requireAdmin(req, res) {
-  const user = readSession(req);
+async function requireAdmin(req, res) {
+  const user = await readSession(req);
   if (!user) { json(res, 401, { error: 'not signed in' }); return null; }
   if (!isAdmin(user)) { json(res, 403, { error: 'forbidden' }); return null; }
   return user;
@@ -328,18 +330,18 @@ setInterval(() => { for (const [k, v] of presence) if (Date.now() - v.updatedAt 
 
 /* ---------- routes ---------- */
 const routes = {
-  'GET /api/health': async (req, res) => json(res, 200, { ok: true, users: repo.users.count() }),
+  'GET /api/health': async (req, res) => json(res, 200, { ok: true, users: await repo.users.count() }),
 
   // Public config the login screen needs before anyone is signed in.
   'GET /api/config': async (req, res) => json(res, 200, {
     invite_only: INVITE_ONLY,
     // True only while the instance has no accounts at all. The first account created
     // becomes the admin — see POST /api/admin/bootstrap. Exposes no user data.
-    needs_bootstrap: repo.users.count() === 0
+    needs_bootstrap: await repo.users.count() === 0
   }),
 
   'GET /api/me': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } });
   },
@@ -349,7 +351,7 @@ const routes = {
     const name = String(body.name || '').trim().slice(0, 40);
     if (!name) return json(res, 400, { error: 'name required' });
     const code = String(body.code || '').trim().toUpperCase();
-    if (INVITE_ONLY && !repo.invites.validByCode(code))
+    if (INVITE_ONLY && !await repo.invites.validByCode(code))
       return json(res, 403, { error: 'a valid invite code is required' });
     const uid = crypto.randomBytes(12).toString('base64url');
     const options = await generateRegistrationOptions({
@@ -379,24 +381,24 @@ const routes = {
     } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
     if (!verification.verified) return json(res, 400, { error: 'not verified' });
     const { credential } = verification.registrationInfo;
-    if (repo.creds.byId(credential.id)) return json(res, 409, { error: 'credential already registered' });
+    if (await repo.creds.byId(credential.id)) return json(res, 409, { error: 'credential already registered' });
     // Re-check the invite at the last moment (it may have been used/revoked since options), then burn it.
     let invite = null;
     if (INVITE_ONLY) {
-      invite = repo.invites.validByCode(c.code);
+      invite = await repo.invites.validByCode(c.code);
       if (!invite) return json(res, 403, { error: 'invite code is no longer valid — ask for a new one' });
     }
     const user = { id: c.uid, name: c.name, created: new Date().toISOString() };
     if (invite) { user.invitedBy = invite.code; }
-    db.tx(() => {
-      repo.users.insert(user);
-      repo.creds.insert({
+    await db.tx(async () => {
+      await repo.users.insert(user);
+      await repo.creds.insert({
         id: credential.id, userId: user.id,
         publicKey: Buffer.from(credential.publicKey).toString('base64url'),
         counter: credential.counter || 0,
         transports: body.credential?.response?.transports || []
       });
-      if (invite) { invite.usedBy = user.id; invite.usedAt = user.created; repo.invites.update(invite); }
+      if (invite) { invite.usedBy = user.id; invite.usedAt = user.created; await repo.invites.update(invite); }
     });
     json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
   },
@@ -413,7 +415,7 @@ const routes = {
     const body = await readBody(req);
     const c = takeChallenge(body.cid);
     if (!c) return json(res, 400, { error: 'challenge expired — try again' });
-    const cred = repo.creds.byId(body.credential?.id);
+    const cred = await repo.creds.byId(body.credential?.id);
     if (!cred) return json(res, 404, { error: 'unknown passkey — create a profile first' });
     let verification;
     try {
@@ -433,8 +435,8 @@ const routes = {
     } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
     if (!verification.verified) return json(res, 400, { error: 'not verified' });
     cred.counter = verification.authenticationInfo.newCounter;
-    repo.creds.update(cred);
-    const user = repo.users.byId(cred.userId);
+    await repo.creds.update(cred);
+    const user = await repo.users.byId(cred.userId);
     if (!user) return json(res, 500, { error: 'user missing' });
     if (user.disabled) return json(res, 403, { error: 'this account has been disabled' });
     json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
@@ -451,12 +453,12 @@ const routes = {
     if (!name || name.length > 40) return json(res, 400, { error: 'name is required (max 40 characters)' });
     if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
     if (password.length > PASSWORD_MAX) return json(res, 400, { error: 'password is too long' });
-    if (repo.users.existsByName(name)) {
+    if (await repo.users.existsByName(name)) {
       return json(res, 409, { error: 'a user with that name already exists' });
     }
     let invite = null;
     if (INVITE_ONLY) {
-      invite = repo.invites.validByCode(code);
+      invite = await repo.invites.validByCode(code);
       if (!invite) return json(res, 403, { error: 'invite code is required — ask the admin for one' });
     }
     const user = {
@@ -466,9 +468,9 @@ const routes = {
       passwordHash: hashPassword(password)
     };
     if (invite) { user.invitedBy = invite.code; }
-    db.tx(() => {
-      repo.users.insert(user);
-      if (invite) { invite.usedBy = user.id; invite.usedAt = user.created; repo.invites.update(invite); }
+    await db.tx(async () => {
+      await repo.users.insert(user);
+      if (invite) { invite.usedBy = user.id; invite.usedAt = user.created; await repo.invites.update(invite); }
     });
     json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
   },
@@ -484,7 +486,7 @@ const routes = {
     if (loginBlocked(key)) {
       return json(res, 429, { error: 'too many failed attempts — try again in a few minutes' });
     }
-    const user = repo.users.byName(name);
+    const user = await repo.users.byName(name);
     // One generic message for every failure mode (unknown user, wrong password, no
     // password set) — anything more specific tells an attacker which accounts exist.
     const fail = () => { noteFailedAttempt(key); return json(res, 401, { error: 'invalid name or password' }); };
@@ -500,7 +502,7 @@ const routes = {
   // over the account. Also bumps the session version, which signs out every other
   // device — the same revocation /api/logout/all performs.
   'POST /api/password': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     const password = String(body.password || '');
@@ -512,7 +514,7 @@ const routes = {
     }
     user.passwordHash = hashPassword(password);
     user.sv = sessionVersion(user) + 1;
-    repo.users.update(user);
+    await repo.users.update(user);
     json(res, 200, { ok: true, signedOut: true });
   },
 
@@ -523,61 +525,61 @@ const routes = {
   // The caller's own cookie is cleared here too, so the browser doing it doesn't sit on a token
   // it no longer accepts. Passkeys are untouched: signing back in works immediately.
   'POST /api/logout/all': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     user.sv = sessionVersion(user) + 1;
-    repo.users.update(user);
+    await repo.users.update(user);
     json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie });
   },
 
   'GET /api/data': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    json(res, 200, { state: repo.state.get(user.id) });
+    json(res, 200, { state: await repo.state.get(user.id) });
   },
 
   'PUT /api/data': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     if (!body.state || typeof body.state !== 'object') return json(res, 400, { error: 'state required' });
     delete body.state.active;              // in-progress workouts stay device-local
-    repo.state.set(user.id, body.state);
+    await repo.state.set(user.id, body.state);
     json(res, 200, { ok: true, ts: body.state._ts || null });
   },
 
   'GET /api/push/public-key': async (req, res) => json(res, 200, { key: vapid.publicKey }),
 
   'POST /api/push/subscribe': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     const sub = body.subscription;
     if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) return json(res, 400, { error: 'invalid subscription' });
-    db.tx(() => {
-      repo.subs.deleteByEndpoint(sub.endpoint);
-      repo.subs.insert({ userId: user.id, endpoint: sub.endpoint, keys: sub.keys, created: new Date().toISOString() });
+    await db.tx(async () => {
+      await repo.subs.deleteByEndpoint(sub.endpoint);
+      await repo.subs.insert({ userId: user.id, endpoint: sub.endpoint, keys: sub.keys, created: new Date().toISOString() });
     });
     json(res, 200, { ok: true });
   },
 
   'POST /api/push/unsubscribe': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
-    repo.subs.deleteByUserEndpoint(user.id, body.endpoint);
+    await repo.subs.deleteByUserEndpoint(user.id, body.endpoint);
     json(res, 200, { ok: true });
   },
 
   'POST /api/push/test': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     await sendPush(user.id, { title: 'openGym', body: 'Test notification ✅ — this is what alerts look like.', tag: 'test' });
     json(res, 200, { ok: true });
   },
 
   'POST /api/push/rest-timer': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     const sec = Math.max(1, Math.min(3600, Math.round(+body.seconds || 0)));
@@ -587,7 +589,7 @@ const routes = {
   },
 
   'POST /api/push/rest-timer/cancel': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     cancelRestTimer(user.id);
     json(res, 200, { ok: true });
@@ -595,7 +597,7 @@ const routes = {
 
   // Live-workout heartbeat: client pings while a workout is on screen; { active:false } drops it.
   'POST /api/activity': async (req, res) => {
-    const user = readSession(req);
+    const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     if (body.active) {
@@ -618,7 +620,7 @@ const routes = {
   // account created on an empty instance becomes the admin. Only when the instance has
   // zero users, so it can never hand the admin flag to a later arrival.
   'POST /api/admin/bootstrap': async (req, res) => {
-    if (repo.users.count()) return json(res, 409, { error: 'this instance already has users — ask an admin for an account' });
+    if (await repo.users.count()) return json(res, 409, { error: 'this instance already has users — ask an admin for an account' });
     const body = await readBody(req);
     const name = String(body.name || '').trim();
     const password = String(body.password || '');
@@ -632,7 +634,7 @@ const routes = {
       admin: true,
       passwordHash: hashPassword(password)
     };
-    repo.users.insert(user);
+    await repo.users.insert(user);
     json(res, 200, { ok: true, user: { id: user.id, name: user.name, admin: true } }, { 'Set-Cookie': sessionCookie(user) });
   },
 
@@ -641,12 +643,12 @@ const routes = {
   // on their own device; this is for an account that has to exist now, with a
   // password the admin sets and hands over. The account can also be flagged admin.
   'POST /api/admin/user/create': async (req, res) => {
-    const admin = requireAdmin(req, res); if (!admin) return;
+    const admin = await requireAdmin(req, res); if (!admin) return;
     const body = await readBody(req);
     const name = String(body.name || '').trim();
     const password = String(body.password || '');
     if (!name || name.length > 40) return json(res, 400, { error: 'name is required (max 40 characters)' });
-    if (repo.users.existsByName(name)) {
+    if (await repo.users.existsByName(name)) {
       return json(res, 409, { error: 'a user with that name already exists' });
     }
     if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
@@ -658,7 +660,7 @@ const routes = {
       passwordHash: hashPassword(password)
     };
     if (body.admin === true) { user.admin = true; user.sv = 1; }
-    repo.users.insert(user);
+    await repo.users.insert(user);
     json(res, 200, { ok: true, user: { id: user.id, name: user.name, admin: isAdmin(user) } });
   },
 
@@ -666,46 +668,47 @@ const routes = {
   // "current password" here because the admin is not the account holder. Bumps the
   // session version so every existing cookie for that account stops verifying.
   'POST /api/admin/user/password': async (req, res) => {
-    const admin = requireAdmin(req, res); if (!admin) return;
+    const admin = await requireAdmin(req, res); if (!admin) return;
     const body = await readBody(req);
     const id = String(body.id || '');
     const password = String(body.password || '');
-    const u = repo.users.byId(id);
+    const u = await repo.users.byId(id);
     if (!u) return json(res, 404, { error: 'no such user' });
     if (password.length < PASSWORD_MIN) return json(res, 400, { error: 'password must be at least ' + PASSWORD_MIN + ' characters' });
     if (password.length > PASSWORD_MAX) return json(res, 400, { error: 'password is too long' });
     u.passwordHash = hashPassword(password);
     u.sv = sessionVersion(u) + 1;
-    repo.users.update(u);
+    await repo.users.update(u);
     json(res, 200, { ok: true });
   },
 
   'GET /api/admin/users': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
-    const users = repo.users.list().map(u => {
-      const S = repo.state.get(u.id) || {};
+    if (!await requireAdmin(req, res)) return;
+    const users = [];
+    for (const u of await repo.users.list()) {
+      const S = (await repo.state.get(u.id)) || {};
       const workouts = S.workouts || [];
       const last = workouts[workouts.length - 1];
-      return {
+      users.push({
         id: u.id, name: u.name, created: u.created || null,
         disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null, hasPassword: !!u.passwordHash,
         workouts: workouts.length,
         lastWorkout: last ? last.d : null,
         lastSync: S._ts || null,
-        hasPush: repo.subs.hasForUser(u.id),
+        hasPush: await repo.subs.hasForUser(u.id),
         live: livePresence(u.id)
-      };
-    });
+      });
+    }
     json(res, 200, { users, invite_only: INVITE_ONLY, now: Date.now() });
   },
 
   // Drill-down: full workout history + body-weight log for one user.
   'GET /api/admin/user': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
+    if (!await requireAdmin(req, res)) return;
     const id = new URL(req.url, 'http://x').searchParams.get('id');
-    const u = repo.users.byId(id);
+    const u = await repo.users.byId(id);
     if (!u) return json(res, 404, { error: 'no such user' });
-    const S = repo.state.get(u.id) || {};
+    const S = (await repo.state.get(u.id)) || {};
     json(res, 200, {
       user: { id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null },
       unit: S.unit || 'kg',
@@ -717,47 +720,49 @@ const routes = {
   },
 
   'POST /api/admin/user/disable': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
+    if (!await requireAdmin(req, res)) return;
     const body = await readBody(req);
-    const u = repo.users.byId(body.id);
+    const u = await repo.users.byId(body.id);
     if (!u) return json(res, 404, { error: 'no such user' });
     if (isAdmin(u)) return json(res, 400, { error: 'cannot disable an admin' });
     u.disabled = !!body.disabled;
     if (u.disabled) presence.delete(u.id);   // drop them off "training now" at once
-    repo.users.update(u);
+    await repo.users.update(u);
     json(res, 200, { ok: true, id: u.id, disabled: u.disabled });
   },
 
   'GET /api/admin/invites': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
+    if (!await requireAdmin(req, res)) return;
     // resolve usedBy uid → name for display
-    const invites = repo.invites.list().map(i => ({
-      ...i, usedByName: i.usedBy ? (repo.users.byId(i.usedBy) || {}).name || null : null
-    }));
+    const invites = [];
+    for (const i of await repo.invites.list()) {
+      const usedBy = i.usedBy ? await repo.users.byId(i.usedBy) : null;
+      invites.push({ ...i, usedByName: usedBy ? usedBy.name : null });
+    }
     json(res, 200, { invites, invite_only: INVITE_ONLY });
   },
 
   'POST /api/admin/invites/new': async (req, res) => {
-    const admin = requireAdmin(req, res); if (!admin) return;
+    const admin = await requireAdmin(req, res); if (!admin) return;
     const body = await readBody(req);
     let code;
     // 16 hex chars = 64 bits, up from 8 chars / 32 bits. The app has no rate limiting by design
     // (that's the reverse proxy's job) and /api/register/options tells a caller whether a code is
     // good, so the code itself has to be the thing that isn't worth guessing. Codes already in
     // the store keep working — validation is an exact string compare, never a length or format check.
-    do { code = crypto.randomBytes(8).toString('hex').toUpperCase(); } while (repo.invites.existsByCode(code));
+    do { code = crypto.randomBytes(8).toString('hex').toUpperCase(); } while (await repo.invites.existsByCode(code));
     const invite = { code, note: String(body.note || '').slice(0, 60), createdBy: admin.id, created: new Date().toISOString() };
-    repo.invites.insert(invite);
+    await repo.invites.insert(invite);
     json(res, 200, { invite });
   },
 
   'POST /api/admin/invites/revoke': async (req, res) => {
-    if (!requireAdmin(req, res)) return;
+    if (!await requireAdmin(req, res)) return;
     const body = await readBody(req);
-    const inv = repo.invites.byCode(String(body.code || '').toUpperCase());
+    const inv = await repo.invites.byCode(String(body.code || '').toUpperCase());
     if (!inv) return json(res, 404, { error: 'no such code' });
     if (inv.usedBy) return json(res, 400, { error: 'already used — cannot revoke' });
-    repo.invites.deleteByCode(inv.code);
+    await repo.invites.deleteByCode(inv.code);
     json(res, 200, { ok: true });
   }
 };

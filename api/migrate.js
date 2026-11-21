@@ -17,10 +17,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export function migrateLegacyJson({ dataDir, repo }) {
+export async function migrateLegacyJson({ dataDir, repo }) {
   const legacyFile = path.join(dataDir, 'db.json');
   if (!fs.existsSync(legacyFile)) return { imported: false, reason: 'no legacy file' };
-  if (repo.users.count() > 0) return { imported: false, reason: 'database already has users' };
+  if (await repo.users.count() > 0) return { imported: false, reason: 'database already has users' };
 
   let legacy;
   try {
@@ -42,21 +42,21 @@ export function migrateLegacyJson({ dataDir, repo }) {
 
   let states = 0;
   for (const u of users) {
-    for (const c of creds.filter(x => x.userId === u.id)) repo.creds.insert(c);
-    for (const s of subs.filter(x => x.userId === u.id)) repo.subs.insert(s);
-    for (const i of invites.filter(x => x.usedBy === u.id)) repo.invites.insert(i);
-    repo.users.insert(u);
+    for (const c of creds.filter(x => x.userId === u.id)) await repo.creds.insert(c);
+    for (const s of subs.filter(x => x.userId === u.id)) await repo.subs.insert(s);
+    for (const i of invites.filter(x => x.usedBy === u.id)) await repo.invites.insert(i);
+    await repo.users.insert(u);
 
     const file = path.join(dataDir, 'state-' + u.id.replace(/[^a-zA-Z0-9_-]/g, '') + '.json');
     if (fs.existsSync(file)) {
       try {
-        repo.state.set(u.id, JSON.parse(fs.readFileSync(file, 'utf8')));
+        await repo.state.set(u.id, JSON.parse(fs.readFileSync(file, 'utf8')));
         states++;
       } catch { /* an unreadable state file is not fatal — the user re-syncs from their device */ }
     }
   }
   // Invites nobody used still have to come across.
-  for (const i of invites.filter(x => !x.usedBy)) repo.invites.insert(i);
+  for (const i of invites.filter(x => !x.usedBy)) await repo.invites.insert(i);
 
   return { imported: true, users: users.length, creds: creds.length, subs: subs.length, invites: invites.length, states, stateFiles: stateFiles.length };
 }

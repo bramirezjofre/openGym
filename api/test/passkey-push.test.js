@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { resetStore, pgSchemaUrl, isPostgres } from './helpers.js';
 
 const PORT = 3972;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -36,6 +37,19 @@ const cookieOf = res => (res.setCookie || '').split(';')[0];
 
 before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gym-api2-'));
+  // On Postgres each test file gets its own schema, so the files can run in
+  // parallel without truncating each other's tables.
+  if (isPostgres()) process.env.DATABASE_URL = await pgSchemaUrl('push');
+  await resetStore();
+  // If something is already listening on the port, the requests would go to
+  // that process and the assertions would be about someone else's state.
+  // Fail loudly instead of testing the wrong server.
+  try {
+    const probe = await fetch(BASE + '/api/health');
+    if (probe.ok) throw new Error('port ' + PORT + ' is already in use by another server');
+  } catch (e) {
+    if (e.message && e.message.includes('already in use')) throw e;
+  }
   child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'server.js'], {
     cwd: path.resolve(import.meta.dirname, '..'),
     env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir, RP_ID: 'localhost', ORIGIN: 'http://localhost:8080' },
