@@ -2,7 +2,7 @@ FROM node:22-alpine
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev && npm cache clean --force
-COPY server.js db.js repo.js schema.js migrate.js ./
+COPY server.js db.js repo.js schema.js migrate.js db-postgres.js ./
 ENV NODE_ENV=production
 EXPOSE 3000
 # node:sqlite is still flagged experimental in Node 22 and prints a warning on first use.

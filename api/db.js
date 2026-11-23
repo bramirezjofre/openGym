@@ -116,7 +116,10 @@ export function openSqlite(file) {
  *   postgres://...      -> Postgres
  *
  * The Postgres driver is loaded on demand, so the default deployment never
- * loads `pg` and never needs it installed. The repository and every handler
+ * loads `pg`. It is installed in the image all the same (a regular
+ * dependency, not a dev one) so that pointing DATABASE_URL at a Postgres is a
+ * configuration change and not a rebuild — the copy of db-postgres.js has to
+ * be in the image for that switch to work. The repository and every handler
  * above this file are identical on both engines — that is the claim the
  * dual-engine test suite (test/repo.test.js and test/repo-postgres.test.js)
  * checks.
